@@ -1,0 +1,210 @@
+"""Bounded GB10 image API using the existing CreativeLane; no video pipeline."""
+import asyncio
+import os
+import threading
+import time
+import uuid
+import sys
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal
+
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'build/sources/atlas-gpt-main'))
+from atlas.offline_guard import install
+
+install()
+from showcase_app.creative import CreativeLane
+from showcase_app.gateway import execution_end, execution_start, record
+from showcase_app.gb10_image_policy import stage_prompt, stage_brief, check_artwork, NO_LETTERING, STAGE_CONDITIONING_TOKENS
+
+from showcase_app.gb10_errors import WorkflowError, is_memory_error, public_failure
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / 'state/stage/creative'
+lane = CreativeLane()
+queue = asyncio.Queue(maxsize=3)
+jobs = {}
+
+
+async def work():
+    while True:
+        job, spec = await queue.get()
+        began = time.time()
+        try:
+            job.update(status='running', started=began)
+            execution_start(job['id'], 'stage_image', 'FLUX.2-klein-4B')
+            pending = OUTPUT / 'pending' / job['id']
+            pending.mkdir(parents=True, exist_ok=False)
+            accepted = []
+            aggregate = {'render_seconds': 0, 'gpu_peak_allocated_bytes': 0, 'gpu_peak_reserved_bytes': 0}
+            stage = getattr(spec, 'art_direction', 'stage') == 'stage'
+            briefs = [stage_brief(spec.batch, index) for index in range(spec.batch)] if stage else []
+            job.update(policy='Fictional Northwind planning-pilot visuals' if stage else 'User-directed wordless artwork',
+                       briefs=[{key: brief[key] for key in ('id', 'title', 'use')} for brief in briefs],
+                       checker_model='Qwen3.6-35B-A3B', text_rejections=0, relevance_rejections=0,
+                       images_generated=0, text_checks=[], _private=True)
+            for index in range(spec.batch):
+                for attempt in range(2):
+                    if job['_stop'].is_set():
+                        raise InterruptedError('Artwork job cancelled')
+                    path = pending / (str(index) + '-' + str(attempt) + '.png')
+                    job.update(phase='rendering', stage='Rendering ' + briefs[index]['title'] if stage else 'Rendering wordless artwork', batch_index=index + 1)
+                    prompt = free_prompt(spec) if getattr(spec, 'art_direction', 'stage') == 'free' else stage_prompt(spec.batch, index)
+                    while True:
+                        retry_memory = False
+                        try:
+                            metrics = await asyncio.to_thread(lane.run, 'image', prompt, path, job['_stop'],
+                                {'width': spec.width, 'height': spec.height, 'batch': 1, 'seed': spec.seed + index + attempt * 1009, 'public_index': index + 1, 'public_total': spec.batch, 'public_title': briefs[index]['title'] if stage else 'Wordless artwork', **({'max_sequence_length': STAGE_CONDITIONING_TOKENS} if stage else {})}, job)
+                            break
+                        except Exception as exc:
+                            if is_memory_error(exc) and job.get('memory_retries', 0) < 1:
+                                retry_memory = True
+                            else:
+                                raise
+                        if retry_memory:
+                            # Leave the exception scope before collecting tensors
+                            # retained by its traceback. One retry per whole job.
+                            from showcase_app.gb10_memory import release_unused_buffers
+                            job['memory_retries'] = job.get('memory_retries', 0) + 1
+                            job.update(phase='waiting', stage='Releasing unused image buffers before one retry')
+                            await asyncio.to_thread(release_unused_buffers)
+                            await asyncio.sleep(.3)
+                            if job['_stop'].is_set():
+                                raise InterruptedError('Artwork job cancelled')
+
+                    aggregate['render_seconds'] += metrics['render_seconds']
+                    for key in ('gpu_peak_allocated_bytes', 'gpu_peak_reserved_bytes'):
+                        aggregate[key] = max(aggregate[key], metrics[key])
+                    job['images_generated'] += 1
+                    job.update(phase='checking', stage='Checking subject and lettering' if stage else 'Checking for lettering')
+                    check = await check_artwork(path, spec.run_id, spec.purpose, brief=briefs[index]) if stage else await check_artwork(path, spec.run_id, spec.purpose)
+                    job['text_checks'].append({'image': index + 1, 'attempt': attempt + 1, **check})
+                    if not check['text'] and (not stage or check.get('relevant') is True):
+                        accepted.append(path)
+                        break
+                    path.unlink(missing_ok=True)
+                    reason = 'text' if check['text'] else 'relevance'
+                    job['text_rejections' if check['text'] else 'relevance_rejections'] += 1
+                    job['stage'] = 'Lettering rejected; generating a new image' if check['text'] else 'Visual brief not met; generating a new image'
+                    logging.info('Artwork rejected id=%s image=%s attempt=%s reason=%s', job['id'], index + 1, attempt + 1, reason)
+                else:
+                    raise WorkflowError('image_review', 'An image did not pass local subject or lettering review. Retry the image task.')
+                job['images_done'] = len(accepted)
+            if job['_stop'].is_set():
+                raise InterruptedError('Artwork job cancelled')
+            files = []
+            for index, path in enumerate(accepted):
+                target = OUTPUT / (job['id'] + (('-' + str(index + 1)) if spec.batch > 1 else '') + '.png')
+                path.replace(target)
+                files.append(target.name)
+            pending.rmdir()
+            job.update(status='complete', phase='complete', stage='Visual brief and lettering review passed' if stage else 'Text check clear', ended=time.time(), files=files, **aggregate)
+            record(job['id'], 'stage_image', 'image', 'FLUX.2-klein-4B', 'complete', began,
+                   run_id=spec.run_id, purpose=spec.purpose, images=job['images_generated'])
+        except Exception as exc:
+            logging.exception('GB10 image job failed id=%s', job['id'])
+            job.update(status='cancelled' if job['_stop'].is_set() else 'failed', error=type(exc).__name__, failure=public_failure(exc), ended=time.time())
+            record(job['id'], 'stage_image', 'image', 'FLUX.2-klein-4B', job['status'], began, images=job.get('images_generated', 0),
+                   error=type(exc).__name__, run_id=spec.run_id, purpose=spec.purpose)
+        finally:
+            import shutil
+            shutil.rmtree(OUTPUT / 'pending' / job['id'], ignore_errors=True)
+            execution_end(job['id'], job['status'])
+            queue.task_done()
+        # Exception tracebacks can retain inference tensors through the inner
+        # pipeline's finally block. Collect after leaving the except block too.
+        from showcase_app.gb10_memory import release_unused_buffers
+        job['post_job_cleanup'] = await asyncio.to_thread(release_unused_buffers)
+
+
+@asynccontextmanager
+async def lifespan(app):
+    if os.getenv('FURY_PROFILE') != 'gb10':
+        raise RuntimeError('This API requires the GB10 profile')
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+    await asyncio.to_thread(lane.load)
+    task = asyncio.create_task(work())
+    yield
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+app = FastAPI(docs_url=None, redoc_url=None, lifespan=lifespan)
+from showcase_app.gb10_security import StageRequestGuard
+app.add_middleware(StageRequestGuard, limit=32768)
+
+
+class ImageRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    prompt: str = Field(min_length=5, max_length=1500)
+    width: Literal[1024, 1344] = 1024
+    height: Literal[576, 768] = 576
+    batch: Literal[1, 2, 4] = 1
+    seed: int = Field(default=42, ge=0, le=4294967295)
+    run_id: str = Field(pattern=r'^[A-Za-z0-9_-]{1,100}$')
+    purpose: Literal['live', 'warmup', 'keepalive'] = 'live'
+    art_direction: Literal['stage', 'free'] = 'stage'
+    style: Literal['Studio', 'Photographic', 'Architectural', 'Illustration', 'Cinematic'] = 'Studio'
+
+
+def free_prompt(spec):
+    directions = {
+        'Studio': 'Museum-quality studio material study, meticulous physical detail and controlled lighting. ',
+        'Photographic': 'Refined editorial photography, natural materials, precise composition and beautiful light. ',
+        'Architectural': 'Architectural visualization, monumental geometry, carefully composed spaces and refined material detail. ',
+        'Illustration': 'Original editorial illustration, sophisticated color palette and clear sculptural forms. ',
+        'Cinematic': 'Cinematic still life, dramatic light, restrained color grading and extraordinary material detail. ',
+    }
+    return directions[spec.style] + spec.prompt + NO_LETTERING
+
+
+def public(job):
+    return {key: value for key, value in job.items() if not key.startswith('_')}
+
+
+@app.get('/health')
+async def health():
+    return {'ready': lane.flux is not None, 'model': 'FLUX.2-klein-4B', 'placement': lane.placement(),
+            'active': sum(job['status'] == 'running' for job in jobs.values()),
+            'render_active': sum(job['status'] == 'running' and job.get('phase') == 'rendering' for job in jobs.values()), 'queued': queue.qsize(), 'limit': 1,
+            'parameter_count': getattr(lane, 'parameter_count', None), 'load_timings': getattr(lane, 'load_timings', {}),
+            'weight_file_cache': getattr(lane, 'weight_cache', None), 'load_cleanup': getattr(lane, 'load_cleanup', None), 'conditioning_ties': getattr(lane, 'conditioning_ties', None)}
+
+
+@app.post('/generate')
+async def generate(spec: ImageRequest, request: Request):
+    if request.headers.get('origin') not in (None, 'http://127.0.0.1:18808', 'http://localhost:18808'):
+        raise HTTPException(403, 'Only local stage origins are accepted')
+    if (spec.width, spec.height) not in ((1024, 576), (1344, 768)):
+        raise HTTPException(422, 'Unsupported stage image size')
+    if spec.art_direction == 'stage' and spec.batch == 2:
+        raise HTTPException(422, 'The stage uses batches of one or four')
+    if queue.full():
+        raise HTTPException(429, 'Local image queue is full')
+    cid = uuid.uuid4().hex
+    job = {'id': cid, 'status': 'queued', 'created': time.time(), 'model': 'FLUX.2-klein-4B',
+           'batch': spec.batch, 'images_done': 0, '_stop': threading.Event()}
+    jobs[cid] = job
+    queue.put_nowait((job, spec))
+    return public(job)
+
+
+@app.get('/jobs/{cid}')
+async def job(cid: str):
+    if cid not in jobs:
+        raise HTTPException(404, 'Unknown local image job')
+    return public(jobs[cid])
+
+
+@app.post('/jobs/{cid}/cancel')
+async def cancel(cid: str, request: Request):
+    if request.headers.get('origin') not in (None, 'http://127.0.0.1:18808', 'http://localhost:18808'):
+        raise HTTPException(403, 'Only local stage origins are accepted')
+    if cid not in jobs:
+        raise HTTPException(404, 'Unknown local image job')
+    jobs[cid]['_stop'].set()
+    return {'cancel_requested': True}

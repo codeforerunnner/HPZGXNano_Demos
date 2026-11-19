@@ -1,0 +1,4 @@
+-r requirements-vision-review.lock
+pycuda==2026.1
+# Install the TensorRT Python distribution matching the Nano's NVIDIA stack
+# separately. Do not let an arbitrary pip upgrade replace the system runtime.

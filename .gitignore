@@ -1,0 +1,27 @@
+# Python & virtualenvs
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs, runtime outputs, and local artifacts
+logs/
+runs/
+*.log
+*.tmp
+
+# Model weights and large archives
+*.gguf
+*.onnx
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.zip
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

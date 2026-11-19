@@ -1,0 +1,6 @@
+[
+  {"file":"synthetic-lab-1.mp4","name":"SYNTHETIC Research Workflow","discipline":"UI WALKTHROUGH ONLY","slot":1,"detection_mode":"people_objects","conf_threshold":0.3,"fit":"cover","enhance_inference":false},
+  {"file":"synthetic-lab-2.mp4","name":"SYNTHETIC Lab Activity","discipline":"UI WALKTHROUGH ONLY","slot":2,"detection_mode":"people_objects","conf_threshold":0.3,"fit":"cover","enhance_inference":false},
+  {"file":"synthetic-lab-3.mp4","name":"SYNTHETIC Experiment Flow","discipline":"UI WALKTHROUGH ONLY","slot":3,"detection_mode":"people_objects","conf_threshold":0.3,"fit":"cover","enhance_inference":false},
+  {"file":"synthetic-lab-4.mp4","name":"SYNTHETIC Engineering Flow","discipline":"UI WALKTHROUGH ONLY","slot":4,"detection_mode":"people_only","conf_threshold":0.3,"fit":"cover","enhance_inference":false}
+]

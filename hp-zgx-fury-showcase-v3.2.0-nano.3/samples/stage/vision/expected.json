@@ -1,0 +1,48 @@
+{
+  "whiteboard.png": [
+    {
+      "action": "MAP THE OFFLINE PILOT",
+      "owner": "ALEX ROWAN",
+      "date": "2027-04-12"
+    },
+    {
+      "action": "REVIEW ACCESS CONTROLS",
+      "owner": "CASEY MOSS",
+      "date": "2027-04-15"
+    },
+    {
+      "action": "APPROVE THE SUCCESS MEASURES",
+      "owner": "JORDAN VALE",
+      "date": "2027-04-19"
+    }
+  ],
+  "chart.png": {
+    "columns": [
+      "Quarter",
+      "Local jobs",
+      "Hours saved"
+    ],
+    "rows": [
+      [
+        "Q1",
+        12,
+        24
+      ],
+      [
+        "Q2",
+        18,
+        36
+      ],
+      [
+        "Q3",
+        24,
+        48
+      ],
+      [
+        "Q4",
+        30,
+        60
+      ]
+    ]
+  }
+}

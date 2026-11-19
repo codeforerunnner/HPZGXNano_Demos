@@ -1,0 +1,931 @@
+"""Single-presenter GB10 stage, real tools, local artifacts and recorded failover."""
+import asyncio
+import copy
+import hashlib
+from contextlib import asynccontextmanager
+import json
+import logging
+import math
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import sys
+import time
+import uuid
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse, HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel
+from typing import Literal
+
+from showcase_app.gb10_errors import public_failure
+from showcase_app.stage_common import ROOT, STATE, build_identity, local_settings, memory, network_state, profile, swap_counters
+
+if os.getenv('FURY_PROFILE') != 'gb10':
+    raise RuntimeError('Executive Stage requires the GB10 profile')
+sys.path.insert(0, str(ROOT / 'ops'))
+sys.path.insert(0, str(ROOT / 'build/sources/atlas-gpt-main'))
+from atlas.offline_guard import install, connects
+install()
+from showcase_app.gb10_agent import NanoAgent, image_job
+from showcase_app.gb10_client import infer, LEAD, WORKER
+from showcase_app.gb10_rush import NanoRush, VOICE_LINE
+from showcase_app.gb10_vision import run_vision
+from showcase_app.gb10_security import StageRequestGuard
+from showcase_app.gb10_miniapp import CSP as APP_CSP
+
+CONFIG = profile()
+BEATS = list(CONFIG['segments'])
+STATIC = ROOT / 'showcase_app/stage'
+CORE = ('lead', 'text', 'image', 'tts', 'gateway')
+PORTS = {name: CONFIG['lanes'][name]['port'] for name in CORE if name != 'gateway'} | {'gateway': CONFIG['gateway_port']}
+CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; connect-src 'self'; frame-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"
+
+
+class Show:
+    def __init__(self):
+        self.build = build_identity()
+        self.settings = local_settings()
+        self.session = uuid.uuid4().hex
+        self.view = -1
+        self.runs = {}
+        self.attempts = []
+        self.serial = 0
+        self.task = None
+        self.active_segment = None
+        self.warm_task = None
+        self.pending = False
+        self.warm = False
+        self.full_warm_complete = False
+        self.resetting = False
+        self.warm_error = ''
+        self.preparation = {'kind': 'functional', 'status': 'idle', 'steps': []}
+        self.health = {}
+        self.telemetry = {}
+        self.viewport = {}
+        self.lock = asyncio.Lock()
+        self.recording = os.getenv('FURY_STAGE_RECORD') == '1'
+        self.keepalive_at = 0
+        self.stopping = False
+        self.maintenance = False
+        self.unresponsive_since = {}
+        self.journal('session', build=self.build['id'])
+
+    def warm_signature(self):
+        digest = hashlib.sha256()
+        digest.update(b'nano-functional-preparation-v2')
+        for name in ('showcase_app/creative.py', 'showcase_app/gb10_creative_api.py', 'showcase_app/gb10_encoder.py', 'showcase_app/gb10_errors.py', 'showcase_app/gb10_agent.py', 'showcase_app/gb10_rush.py', 'showcase_app/gb10_vision.py', 'showcase_app/gb10_client.py', 'showcase_app/gb10_image_policy.py', 'showcase_app/gb10_deck_design.py', 'showcase_app/gb10_miniapp.py', 'config/gb10.json', 'config/model-files.json'):
+            digest.update((ROOT / name).read_bytes())
+        digest.update(str(bool(self.settings['audio'])).encode())
+        return digest.hexdigest()
+
+    def reuse_warm(self):
+        import control
+        try:
+            saved = json.loads((STATE / 'warm.json').read_text())
+            return saved['signature'] == self.warm_signature() and saved.get('version') == 2 and (not self.recording or saved.get('kind') == 'rehearsal') and all(
+                control.unchanged(saved['identities'][name]) and control.identity(control.process(saved['identities'][name]['pid']), name) for name in CORE)
+        except (OSError, ValueError, KeyError):
+            return False
+
+    def journal(self, kind, **data):
+        folder = STATE / 'runs'
+        folder.mkdir(exist_ok=True)
+        with (folder / (self.session + '.jsonl')).open('a') as stream:
+            stream.write(json.dumps({'kind': kind, 'at': time.time(), **data}, ensure_ascii=False) + '\n')
+
+    def current(self):
+        return self.runs.get(BEATS[self.view]) if self.view >= 0 else None
+
+    def emit(self, segment, event):
+        row = self.runs[segment]
+        kind = event.get('kind')
+        if kind == 'step':
+            row['steps'][event['step']['tool']] = event['step']
+        elif kind == 'artifact':
+            row['artifacts'][event['artifact']] = event['data']
+        elif kind == 'job':
+            row['jobs'][event['job']['name']] = event['job']
+        elif kind in ('image_progress', 'images_progress'):
+            row['image_progress'] = event['job']
+        elif kind == 'actions':
+            row['actions'] = event['actions']
+        elif kind == 'readout':
+            row['readout'] = event['text']
+        elif kind == 'plan':
+            row['plan'] = event['plan']
+            row['rehearsed'] = event['rehearsed']
+        elif kind == 'plan_stream':
+            row['plan_text'] = event['text']
+        elif kind == 'app_validating':
+            row['app_validating'] = True
+        elif kind == 'artifact_rejected':
+            row['artifact_revision'] = event
+        elif kind == 'wording_edited':
+            row['wording_edited'] = event['label']
+        row['revision'] += 1
+        # Plan deltas are retained with actual times; no image payload is logged.
+        self.journal('beat_event', segment=segment, run_id=row['id'], event=event)
+
+    async def fetch_health(self):
+        import control
+        try:
+            registry = json.loads((ROOT / 'state/supervisor.json').read_text())
+        except (OSError, ValueError):
+            registry = {}
+        async with httpx.AsyncClient(trust_env=False, timeout=.3) as client:
+            async def check(name, port):
+                try:
+                    if registry.get(name, {}).get('stopping'):
+                        return name, {'ready': False, 'probe_status': 'Owned process is stopping'}
+                    saved = registry.get(name, {}).get('leader')
+                    if not saved or not control.unchanged(saved) or not control.identity(control.process(saved['pid']), name):
+                        return name, {'ready': False, 'probe_status': 'Owned process is not running'}
+                    response = await client.get(f'http://127.0.0.1:{port}/health')
+                    value = response.json()
+                    ready = value.get('status') == 'ok' if name in ('lead', 'text') else value.get('ready', False)
+                    return name, {**value, 'ready': response.status_code == 200 and ready,
+                                  'probe_status': 'HTTP ' + str(response.status_code)}
+                except httpx.TimeoutException:
+                    # GPU work and post-render collection can briefly hold the
+                    # Python GIL. An alive owned process with resident weights
+                    # is distinct from a failed HTTP response or process exit.
+                    prior = self.health.get(name, {})
+                    return name, {**prior, 'ready': prior.get('ready', False),
+                                  'probe_status': 'Health response delayed', 'unresponsive': True}
+                except (httpx.HTTPError, ValueError) as exc:
+                    return name, {'ready': False, 'probe_status': type(exc).__name__}
+            return dict(await asyncio.gather(*(check(n, p) for n, p in PORTS.items())))
+
+    async def telemetry_loop(self):
+        while not self.stopping:
+            self.health = await self.fetch_health()
+            metrics = memory()
+            metrics['network'] = network_state()
+            metrics['gpu'] = {'utilization': None, 'power': None, 'temperature': None}
+            try:
+                process = await asyncio.create_subprocess_exec('nvidia-smi', '--query-gpu=utilization.gpu,power.draw,temperature.gpu',
+                    '--format=csv,noheader,nounits', stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                raw, _ = await asyncio.wait_for(process.communicate(), 2)
+                values = raw.decode().strip().split(',')
+                for key, value in zip(metrics['gpu'], values):
+                    try:
+                        parsed = float(value.strip())
+                        metrics['gpu'][key] = parsed if math.isfinite(parsed) else None
+                    except ValueError:
+                        pass
+            except (OSError, asyncio.TimeoutError):
+                pass
+            metrics['clock'] = time.strftime('%H:%M:%S')
+            metrics['disk_free'] = shutil.disk_usage(ROOT).free
+            if self.view == -1 or 'audio' not in self.telemetry:
+                try:
+                    process = await asyncio.create_subprocess_exec('wpctl', 'inspect', '@DEFAULT_AUDIO_SINK@',
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+                    raw, _ = await asyncio.wait_for(process.communicate(), 2)
+                    metrics['audio'] = {'hdmi': process.returncode == 0 and 'hdmi' in raw.decode().lower()}
+                except (OSError, asyncio.TimeoutError):
+                    metrics['audio'] = {'hdmi': False}
+            else:
+                metrics['audio'] = self.telemetry['audio']
+            gateway = self.health.get('gateway', {})
+            metrics['external_calls'] = gateway.get('external_api_calls')
+            metrics['cloud_bytes'] = 0 if gateway.get('local_only') and gateway.get('external_api_calls') == 0 and connects['blocked'] == 0 else None
+            metrics['totals'] = self.totals()
+            with sqlite3.connect(STATE / 'usage.sqlite') as db:
+                counts = db.execute("SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0) FROM events WHERE run_id LIKE ? AND purpose='live' AND status='complete' AND role NOT IN ('whiteboard','chart','image_text_check')", (self.session + '%',)).fetchone()
+                metrics['pricing_totals'] = {'input_tokens': counts[0], 'output_tokens': counts[1]}
+                metrics['routing'] = [dict(zip(('reason', 'at'), item)) for item in db.execute(
+                    "SELECT r.reason,r.started FROM routing r JOIN events e ON e.id=r.id WHERE e.run_id LIKE ? AND e.purpose='live' AND r.reason!='' ORDER BY r.started DESC LIMIT 1", (self.session + '%',))]
+            self.telemetry = metrics
+            await asyncio.sleep(.75)
+
+    def totals(self):
+        result = {'input_tokens': 0, 'output_tokens': 0, 'images': 0, 'pages': 0, 'images_analyzed': 0, 'tokens_per_second': 0}
+        path = STATE / 'usage.sqlite'
+        if not path.exists():
+            return result
+        with sqlite3.connect(path, timeout=2) as db:
+            values = db.execute('SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(images),0),COALESCE(SUM(pages),0),COALESCE(SUM(images_analyzed),0) FROM events WHERE purpose=? AND run_id LIKE ? AND status=?', ('live', self.session + '%', 'complete')).fetchone()
+        result.update(dict(zip(list(result), values)))
+        active_seconds = sum((row.get('ended', time.time()) - row['started']) for row in self.attempts if row['segment'] in ('S1', 'S2', 'S3'))
+        result['tokens_per_second'] = result['output_tokens'] / max(1, active_seconds)
+        return result
+
+    def backup_checks(self):
+        checks = []
+        for segment in BEATS:
+            path = STATE / 'backup' / (segment + '.mp4')
+            meta = path.with_suffix('.json')
+            try:
+                info = json.loads(meta.read_text())
+                ok = path.is_file() and path.stat().st_size > 10000 and path.stat().st_mtime >= self.build['created'] and info['build'] == self.build['id'] and info.get('verified', {}).get('decode') is True and info.get('label_burned') == 'Recorded run'
+            except (OSError, ValueError, KeyError):
+                ok = False
+            checks.append({'label': segment + ' backup', 'ok': ok, 'fix': 'Run ./launch.sh stage record to create a backup for this build.'})
+        return checks
+
+    def readiness(self):
+        m = memory()
+        checks = [
+            {'label': 'Four models resident', 'ok': all(self.health.get(n, {}).get('ready') for n in CORE), 'fix': 'Run ./launch.sh stage to load the local lanes.'},
+            {'label': 'Models warmed', 'ok': self.warm, 'fix': self.warm_error or 'Checking language, vision, image and voice. Progress appears below.'},
+            {'label': 'Unified memory reserve', 'ok': m['available'] >= CONFIG['minimum_memavailable_gib'] * 2**30, 'fix': 'Close unrelated applications, then run ./launch.sh stage reset.'},
+            {'label': 'Local inference only', 'ok': all(os.getenv(k) == v for k, v in CONFIG['offline'].items()) and self.telemetry.get('cloud_bytes') == 0, 'fix': 'Restart with ./launch.sh stage so the offline profile is applied.'},
+            {'label': 'Display ' + str(self.viewport.get('width', '?')) + ' × ' + str(self.viewport.get('height', '?')), 'ok': self.viewport.get('width', 0) >= 1280 and self.viewport.get('height', 0) >= 720, 'fix': 'Connect HDMI at its native resolution and open the stage kiosk.'},
+            {'label': 'Audio ' + ('on · HDMI' if self.settings['audio'] else 'off'), 'ok': not self.settings['audio'] or (self.health.get('tts', {}).get('ready', False) and self.telemetry.get('audio', {}).get('hdmi', False)), 'fix': 'Select the HDMI sink with the AV team or turn audio off.'},
+            {'label': 'Disk free', 'ok': shutil.disk_usage(ROOT).free > 5 * 2**30, 'fix': 'Make 5 GiB free for session recordings. Do not delete model weights.'},
+            {'label': 'Clock ' + time.strftime('%H:%M'), 'ok': time.time() > 1735689600, 'fix': 'Check the desktop clock before the show.'},
+        ]
+        backups = self.backup_checks()
+        if self.settings.get('require_backups'):
+            checks.extend(backups)
+        manager = globals().get('free_mode')
+        if manager and (manager.active or manager.switching):
+            checks.insert(0, {'label': 'Presenter Mode', 'ok': False,
+                'fix': 'Finish or cancel Free Mode jobs, then select Presenter Mode in its sidebar.'})
+        ready = all(check['ok'] for check in checks if not self.recording or check not in backups)
+        return {'ready': ready, 'checks': checks, 'recording': self.recording,
+                'backups': backups, 'protected': self.settings.get('require_backups', False),
+                'preparation': getattr(self, 'preparation', {})}
+
+    def snapshot(self):
+        row = self.current()
+        if row:
+            row = {**row, 'elapsed': (row.get('ended', time.time()) - row['started'])}
+        return {'session': self.session, 'view': self.view, 'beat': BEATS[self.view] if self.view >= 0 else 'READY',
+                'running': self.task is not None and not self.task.done(),
+                'run': row, 'pending': self.pending, 'warming': not self.warm, 'resetting': self.resetting, 'settings': self.settings,
+                'telemetry': self.telemetry, 'health': self.health, 'readiness': self.readiness(), 'warm_error': self.warm_error,
+                'build': self.build['id'][:12]}
+
+    async def failover(self, segment, reason):
+        row = self.runs[segment]
+        if row['backup']:
+            return
+        verified = next((check['ok'] for check in self.backup_checks() if check['label'] == segment + ' backup'), False)
+        if not verified:
+            row.update(status='failed', failure=reason, backup_unavailable=True)
+            if self.recording:
+                row['recording_error'] = reason
+            self.pending = False
+            self.journal('live_failed_without_backup', segment=segment, reason=reason)
+            return
+        row.update(backup=True, failover_at=time.time(), failover_elapsed=time.time() - row['started'], failure=reason)
+        self.journal('failover', segment=segment, run_id=row['id'], reason=reason, elapsed=row['failover_elapsed'])
+
+    async def watchdog(self):
+        while not self.stopping:
+            if self.resetting:
+                await asyncio.sleep(.1)
+                continue
+            row = self.current()
+            active_name = self.active_segment
+            active = self.runs.get(active_name)
+            if active and active['status'] == 'running' and not active.get('backup'):
+                checks = await self.fetch_health()
+                if self.resetting:
+                    continue
+                failed = []
+                for name in CORE:
+                    if checks[name].get('unresponsive'):
+                        self.unresponsive_since.setdefault(name, time.monotonic())
+                        if time.monotonic() - self.unresponsive_since[name] > 8:
+                            failed.append(name)
+                    else:
+                        self.unresponsive_since.pop(name, None)
+                        if not checks[name].get('ready'):
+                            failed.append(name)
+                if failed:
+                    self.journal('lane_unhealthy', lanes=failed, probes={name: checks[name].get('probe_status') for name in failed})
+                    if active_name == 'S3':
+                        # Rush tasks are independent. Their own errors/timeouts
+                        # finish the affected jobs without cancelling other lanes.
+                        active['lane_warnings'] = failed
+                    else:
+                        affected = {active_name} if active_name else set()
+                        if row and row.get('status') == 'running':
+                            affected.add(BEATS[self.view])
+                        for segment in affected:
+                            if segment in self.runs:
+                                await self.failover(segment, 'Local lane unavailable: ' + ', '.join(failed))
+                        if self.task:
+                            self.task.cancel()
+                if active and active['status'] == 'running' and time.time() - active['started'] > CONFIG['segments'][active_name]['deadline']:
+                    await self.failover(active_name, 'Live run deadline reached')
+                    if self.task:
+                        self.task.cancel()
+            await asyncio.sleep(.15)
+
+    async def execute(self, segment):
+        row = self.runs[segment]
+        try:
+            emit = lambda event: self.emit(segment, event)
+            if segment == 'S1':
+                result = await NanoAgent(row['id'], audio=self.settings['audio'], emit=emit).run()
+            elif segment == 'S2':
+                result = await run_vision(row['id'], emit=emit)
+            elif segment == 'S3':
+                runner = NanoRush(row['id'], audio=self.settings['audio'], emit=emit)
+                result = await runner.run(previous=row['jobs']) if row.get('retry_of') else await runner.run()
+                row['jobs'] = result['jobs']
+            else:
+                self.health = await self.fetch_health()
+                if segment == 'S0' and not all(self.health[n]['ready'] for n in CORE):
+                    raise RuntimeError('Model residency check failed')
+                result = {'totals': self.totals(), 'cloud_bytes': self.telemetry.get('cloud_bytes'),
+                          'unavailable_lanes': [name for name in CORE if not self.health.get(name, {}).get('ready')]}
+            if segment == 'S3' and result['done'] != 6:
+                details = next((job.get('failure') for job in result['jobs'].values() if job.get('failure')),
+                               {'code': 'workflow_failed', 'message': 'Some Rush tasks did not finish. Completed results are kept.', 'retryable': True})
+                row.update(status='partial', result=result, failure_details=details, failure=details['message'])
+                if self.recording or self.settings.get('require_backups'):
+                    await self.failover(segment, details['message'])
+            else:
+                row.update(status='complete', result=result)
+        except asyncio.CancelledError:
+            if segment == 'S3' and any(job.get('status') == 'complete' for job in row['jobs'].values()) and not self.resetting:
+                details = {'code': 'deadline', 'message': 'Some Rush work stopped before finishing. Completed results are kept; retry unfinished tasks.', 'retryable': True}
+                row.update(status='partial', failure_details=details, failure=details['message'],
+                           result={'done': sum(job.get('status') == 'complete' for job in row['jobs'].values()), 'jobs': row['jobs']})
+            elif row['status'] != 'failed':
+                row['status'] = 'interrupted'
+        except Exception as exc:
+            logging.exception('Stage live run failed: %s', segment)
+            row['status'] = 'failed'
+            row['failure_details'] = public_failure(exc)
+            await self.failover(segment, row['failure_details']['message'])
+        finally:
+            row['ended'] = time.time()
+            counters = swap_counters()
+            row['swap_in_pages'] = counters['pswpin'] - row['vm_baseline']['pswpin']
+            row['swap_out_pages'] = counters['pswpout'] - row['vm_baseline']['pswpout']
+            with sqlite3.connect(STATE / 'usage.sqlite') as db:
+                row['routing'] = [dict(zip(('requested', 'actual', 'reason', 'at'), item)) for item in db.execute(
+                    'SELECT r.requested,r.actual,r.reason,r.started FROM routing r JOIN events e ON e.id=r.id WHERE e.run_id=?', (row['id'],))]
+            for route in row['routing']:
+                self.journal('routing', run_id=row['id'], **route)
+            if self.active_segment == segment:
+                self.active_segment = None
+            row['revision'] += 1
+            self.journal('beat_end', segment=segment, run_id=row['id'], seconds=row['ended'] - row['started'], status=row['status'], backup=row['backup'], memory=memory(), minimum_memavailable=row['minimum_memavailable'], swap_in_pages=row['swap_in_pages'], swap_out_pages=row['swap_out_pages'])
+            if self.pending:
+                self.pending = False
+                if not row.get('recording_error'):
+                    if row['backup']:
+                        await asyncio.sleep(.4)
+                    asyncio.create_task(self.next())
+
+    async def next(self):
+        async with self.lock:
+            origin_session = self.session
+            candidate = min(4, self.view + 1)
+            if BEATS[candidate] in self.runs and not self.resetting:
+                self.view = candidate
+                return
+            if self.resetting:
+                self.pending = True
+                return
+            if self.view < 0 and not self.readiness()['ready']:
+                raise HTTPException(409, 'Ready checklist has unresolved items')
+            if self.task and not self.task.done() and not (self.current() or {}).get('backup'):
+                self.pending = True
+                return
+            if self.task and not self.task.done():
+                self.pending = False
+                self.task.cancel()
+                await self.task
+            if self.resetting or self.session != origin_session:
+                return
+            self.view = min(4, self.view + 1)
+            segment = BEATS[self.view]
+            if segment in self.runs:
+                return
+            self.start_segment(segment)
+
+    def start_segment(self, segment, previous=None):
+        self.serial += 1
+        row = {'id': self.session + '_' + segment + '_' + str(self.serial), 'started': time.time(),
+               'segment': segment, 'status': 'running', 'backup': False, 'steps': {}, 'artifacts': {}, 'jobs': {}, 'revision': 0,
+               'minimum_memavailable': memory()['available'], 'vm_baseline': swap_counters()}
+        if previous:
+            row['retry_of'] = previous['id']
+            if segment == 'S3':
+                row['jobs'] = copy.deepcopy(previous.get('jobs', {}))
+                row['retained_jobs'] = sum(job.get('status') == 'complete' for job in row['jobs'].values())
+                source = STATE / 'outputs' / previous['id'] / segment
+                target = STATE / 'outputs' / row['id'] / segment
+                target.mkdir(parents=True, exist_ok=True)
+                if source.is_dir() and not source.is_symlink():
+                    for path in source.iterdir():
+                        if path.is_file() and not path.is_symlink():
+                            shutil.copyfile(path, target / path.name)
+        self.runs[segment] = row
+        self.attempts.append(row)
+        self.active_segment = segment
+        self.journal('beat_start', segment=segment, run_id=row['id'], retry_of=row.get('retry_of'))
+        self.task = asyncio.create_task(self.execute(segment))
+
+    async def retry_current(self):
+        async with self.lock:
+            if self.resetting or self.maintenance or (self.task and not self.task.done()):
+                raise HTTPException(409, 'Wait for the current work to stop before retrying.')
+            row = self.current()
+            if not row or row.get('status') not in ('failed', 'partial', 'interrupted'):
+                raise HTTPException(409, 'There is no unfinished scene to retry.')
+            self.pending = False
+            origin_session, origin_view = self.session, self.view
+            health = await self.fetch_health()
+            if self.resetting or self.session != origin_session or self.view != origin_view or self.current() is not row:
+                raise HTTPException(409, 'The presentation changed. Select the current scene before retrying.')
+            if not all(health.get(name, {}).get('ready') for name in CORE):
+                self.resetting = True
+                row['recovering'] = True
+                row['revision'] += 1
+                try:
+                    await self.recover()
+                except Exception:
+                    logging.exception('Owned service recovery failed')
+                    raise HTTPException(503, 'Local service recovery did not finish. Completed results are kept. Retry or return to Free Mode.')
+                finally:
+                    self.resetting = False
+                    row['recovering'] = False
+                    row['revision'] += 1
+            self.start_segment(BEATS[self.view], previous=row)
+
+    async def recover(self):
+        import control
+        async def operate(action, name):
+            process = await asyncio.create_subprocess_exec(str(ROOT / '.venv/bin/python'), str(ROOT / 'ops/control.py'), action, name,
+                cwd=ROOT, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            if await process.wait():
+                raise RuntimeError('Could not recover ' + name + '; run ./launch.sh stage status')
+        # The qualified image loader materializes CPU weights before upload.
+        # Free the owned native weights during a cold image recovery, then
+        # reload in the measured order. No unrelated process is signalled.
+        if not control.discover('image') or not control.ready('image'):
+            for name in ('lead', 'text'):
+                if control.discover(name):
+                    await operate('stop', name)
+        for name in ('image', 'tts', 'text', 'lead', 'gateway'):
+            existing = control.discover(name)
+            if not existing or not control.ready(name):
+                await operate('restart' if existing else 'start', name)
+
+    async def tiny_warm(self, purpose='keepalive'):
+        run_id = purpose + '_' + uuid.uuid4().hex
+        async def text(model):
+            return await infer([{'role': 'user', 'content': 'Say Ready.'}], model=model, caller='keepalive',
+                               run_id=run_id, purpose=purpose, max_tokens=8)
+        async def voice():
+            async with httpx.AsyncClient(trust_env=False, timeout=12) as client:
+                response = await client.post(f'http://127.0.0.1:{PORTS["tts"]}/v1/audio/speech', json={'input': 'Ready.', 'voice': 'am_michael'})
+                response.raise_for_status()
+        await asyncio.gather(text(LEAD), text(WORKER), voice())
+        result = await image_job('A single original blue paper square, no text.', run_id, purpose, width=1024, height=576)
+        for name in result['files']:
+            (STATE / 'creative' / name).unlink(missing_ok=True)
+        self.journal('keepalive', purpose=purpose, elapsed=time.time())
+
+    async def functional_warmup(self):
+        """Exercise each real inference path once without generating a full show."""
+        import base64
+        run_id = 'warm_' + uuid.uuid4().hex
+        steps = [{'name': name, 'status': 'waiting'} for name in
+                 ('Executive reasoning', 'Language & code', 'Vision', 'Image generation', 'Voice')]
+        self.preparation['steps'] = steps
+
+        async def language(model):
+            result = await infer([{'role': 'user', 'content': 'Reply with the single word Ready.'}],
+                model=model, caller='warmup', run_id=run_id, purpose='warmup', max_tokens=96 if model == LEAD else 24)
+            if not result['content'].strip() or result['finish_reason'] != 'stop':
+                raise RuntimeError('Language readiness probe was incomplete')
+
+        async def vision():
+            encoded = base64.b64encode((ROOT / 'samples/stage/vision/whiteboard.png').read_bytes()).decode()
+            result = await infer([{'role': 'user', 'content': [
+                {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}},
+                {'type': 'text', 'text': 'Does this image contain handwriting? Answer yes or no.'}]}],
+                model=WORKER, caller='warmup', run_id=run_id, purpose='warmup', role='vision_probe', max_tokens=24)
+            if not result['content'].strip() or result['finish_reason'] != 'stop':
+                raise RuntimeError('Vision readiness probe was incomplete')
+
+        async def image():
+            result = await image_job('A single blue ceramic sphere, no text.', run_id, 'warmup', width=1024, height=576)
+            for name in result['files']:
+                (STATE / 'creative' / name).unlink(missing_ok=True)
+
+        async def voice():
+            async with httpx.AsyncClient(trust_env=False, timeout=15) as client:
+                response = await client.post(f'http://127.0.0.1:{PORTS["tts"]}/v1/audio/speech',
+                                             json={'input': 'Ready.', 'voice': 'am_michael'})
+                response.raise_for_status()
+                if len(response.content) < 100:
+                    raise RuntimeError('Voice readiness probe returned no audio')
+
+        async def measured(index, operation):
+            step = steps[index]
+            step.update(status='running', started=time.time())
+            began = time.monotonic()
+            try:
+                await operation()
+                step.update(status='complete', seconds=round(time.monotonic() - began, 2))
+            except BaseException:
+                step['status'] = 'failed'
+                raise
+
+        async with asyncio.timeout(60):
+            # Language/vision and speech share a short bounded phase. Render the
+            # actual presenter cover shape afterward, preserving its measured
+            # reserve and avoiding simultaneous vision/image allocation peaks.
+            async with asyncio.TaskGroup() as group:
+                for index, operation in ((0, lambda: language(LEAD)), (1, lambda: language(WORKER)),
+                                         (2, vision), (4, voice)):
+                    group.create_task(measured(index, operation))
+            await measured(3, image)
+
+    async def warmup(self, full=False):
+        began = time.monotonic()
+        full = full or self.recording
+        self.warm = False
+        self.warm_error = ''
+        self.preparation = {'kind': 'rehearsal' if full else 'functional', 'status': 'running',
+                            'started': time.time(), 'steps': []}
+        try:
+            if full:
+                for number in (1, 2):
+                    for segment, runner in [('S1', lambda rid: NanoAgent(rid, purpose='warmup', audio=self.settings['audio'], emit=lambda event: self.journal('warm_event', event=event)).run()),
+                                            ('S2', lambda rid: run_vision(rid, 'warmup')),
+                                            ('S3', lambda rid: NanoRush(rid, purpose='warmup', audio=self.settings['audio']).run())]:
+                        result = await runner('warm_' + uuid.uuid4().hex)
+                        if segment == 'S3' and result['done'] != 6:
+                            raise RuntimeError('Rush warm-up did not complete all six jobs')
+                        self.journal('warmup', segment=segment, pass_number=number, seconds=result.get('seconds'))
+                await self.tiny_warm('warmup')
+            else:
+                await self.functional_warmup()
+            self.health = await self.fetch_health()
+            if not all(self.health.get(name, {}).get('ready') for name in CORE):
+                raise RuntimeError('A model lane became unavailable during preparation')
+            self.warm = True
+            self.full_warm_complete = full
+            self.keepalive_at = time.monotonic()
+            self.preparation.update(status='complete', seconds=round(time.monotonic() - began, 2))
+            import control
+            identities = {name: control.fingerprint(control.discover(name)) for name in CORE}
+            (STATE / 'warm.json').write_text(json.dumps({'version': 2, 'kind': self.preparation['kind'],
+                'signature': self.warm_signature(), 'passes': 2 if full else 0,
+                'identities': identities, 'seconds': self.preparation['seconds'], 'at': time.time()}))
+            self.journal('warm_complete', preparation=self.preparation)
+        except asyncio.CancelledError:
+            self.preparation['status'] = 'cancelled'
+            raise
+        except Exception as exc:
+            logging.exception('Stage preparation failed')
+            self.warm = self.full_warm_complete = False
+            self.preparation.update(status='failed', seconds=round(time.monotonic() - began, 2))
+            failed = ', '.join(step['name'] for step in self.preparation['steps'] if step['status'] == 'failed')
+            details = public_failure(exc)
+            self.warm_error = details['message'] if details['code'] != 'workflow_failed' else 'Preparation failed' + (' at ' + failed if failed else '') + '. Retry preparation or return to Free Mode.'
+            self.journal('warm_failed', error=type(exc).__name__)
+
+    async def keepalive(self):
+        while not self.stopping:
+            await asyncio.sleep(1)
+            if not free_mode.active and not free_mode.switching and self.warm and self.view == -1 and time.monotonic() - self.keepalive_at >= 60:
+                self.keepalive_at = time.monotonic()
+                self.maintenance = True
+                try:
+                    await self.tiny_warm()
+                except Exception as exc:
+                    logging.exception('Stage idle readiness probe failed')
+                    self.warm = False
+                    self.preparation['status'] = 'failed'
+                    details = public_failure(exc)
+                    self.warm_error = details['message'] if details['code'] != 'workflow_failed' else 'An idle readiness check failed. Retry preparation or return to Free Mode.'
+                    self.journal('keepalive_failed', error=type(exc).__name__)
+                finally:
+                    self.maintenance = False
+
+    async def reset(self, segment=False, *, prepare=True):
+        # A rejected concurrent reset must never clear the first reset's flag.
+        if self.resetting:
+            raise HTTPException(409, 'A reset is already running')
+        try:
+            if prepare:
+                await self._reset(segment)
+            else:
+                await self._reset(segment, prepare=False)
+        except Exception:
+            self.warm = False
+            self.warm_error = 'Reset did not recover every lane. Run ./launch.sh stage status, then ./launch.sh stage reset.'
+            raise
+        finally:
+            self.resetting = False
+
+    async def _reset(self, segment=False, *, prepare=True):
+        if self.resetting:
+            raise HTTPException(409, 'A reset is already running')
+        began = time.monotonic()
+        self.resetting = True
+        self.pending = False
+        if self.task and not self.task.done():
+            self.task.cancel()
+            await self.task
+        if self.warm_task and not self.warm_task.done():
+            self.warm_task.cancel()
+            await asyncio.gather(self.warm_task, return_exceptions=True)
+        self.warm = False
+        if prepare:
+            await self.recover()
+        idle_deadline = time.monotonic() + 20
+        while True:
+            health = await self.fetch_health()
+            if not health['image'].get('active') and not health['image'].get('queued'):
+                break
+            if time.monotonic() > idle_deadline:
+                self.resetting = False
+                raise HTTPException(503, 'The image lane did not finish cancelling. Run ./launch.sh stage reset.')
+            await asyncio.sleep(.1)
+        if not prepare:
+            self.full_warm_complete = False
+        elif self.full_warm_complete:
+            await self.tiny_warm('warmup')
+        else:
+            await self.warmup()
+            if not self.warm:
+                self.resetting = False
+                raise HTTPException(503, self.warm_error)
+        self.resetting = False
+        if segment and self.view >= 0:
+            index = self.view
+            for name in BEATS[index:]:
+                self.runs.pop(name, None)
+            self.view -= 1
+            self.warm = True
+            await self.next()
+        else:
+            self.pending = False
+            self.journal('session_end', totals=self.totals())
+            with sqlite3.connect(STATE / 'usage.sqlite') as db:
+                ids = [x[0] for x in db.execute('SELECT id FROM events WHERE run_id LIKE ? AND role=?', (self.session + '%', 'image'))]
+            for identifier in ids:
+                if re.fullmatch(r'[a-f0-9]{32}', identifier):
+                    for suffix in ('', '-1', '-2', '-3', '-4'):
+                        (STATE / 'creative' / (identifier + suffix + '.png')).unlink(missing_ok=True)
+            for folder in (STATE / 'outputs').glob(self.session + '*'):
+                if folder.is_dir() and not folder.is_symlink():
+                    shutil.rmtree(folder)
+            self.session = uuid.uuid4().hex
+            self.runs = {}
+            self.attempts = []
+            self.view = -1
+            self.warm = prepare
+            self.warm_error = ''
+            self.keepalive_at = time.monotonic()
+            self.journal('session', build=self.build['id'])
+        self.journal('reset', seconds=time.monotonic() - began, segment=segment)
+
+    async def memory_sampler(self):
+        while not self.stopping:
+            available = memory()['available']
+            for row in self.attempts:
+                if row['status'] == 'running':
+                    row['minimum_memavailable'] = min(row['minimum_memavailable'], available)
+            await asyncio.sleep(.1)
+
+
+show = Show()
+
+
+@asynccontextmanager
+async def lifespan(app):
+    tasks = [asyncio.create_task(show.telemetry_loop()), asyncio.create_task(show.watchdog()),
+             asyncio.create_task(show.keepalive()), asyncio.create_task(show.memory_sampler())]
+    if free_mode.active:
+        show.journal('free_mode_started')
+    elif show.reuse_warm():
+        saved = json.loads((STATE / 'warm.json').read_text())
+        show.warm = True
+        show.full_warm_complete = saved.get('kind') == 'rehearsal'
+        show.preparation = {'kind': saved.get('kind'), 'status': 'reused', 'steps': [], 'seconds': 0}
+        show.journal('warm_reused', signature=show.warm_signature())
+    else:
+        show.warm_task = asyncio.create_task(show.warmup())
+        tasks.append(show.warm_task)
+    yield
+    await free_mode.close()
+    show.stopping = True
+    if show.task:
+        show.task.cancel()
+    if show.warm_task:
+        show.warm_task.cancel()
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+app.add_middleware(StageRequestGuard, limit=65536)
+
+from showcase_app.free_mode_api import create_router
+free_router, free_mode = create_router(show)
+app.include_router(free_router)
+
+
+@app.middleware('http')
+async def headers(request, call_next):
+    host_hdr = (request.headers.get('host') or '').lower()
+    if host_hdr and not host_hdr.endswith(':18808') and host_hdr not in ('127.0.0.1', 'localhost'):
+        return JSONResponse({'error': 'Only stage port 18808 is allowed'}, status_code=403)
+    response = await call_next(request)
+    generated_app = request.url.path.endswith('/calculator.html') or (request.url.path.startswith('/free/files/') and request.url.path.endswith('/app.html'))
+    response.headers['Content-Security-Policy'] = APP_CSP if generated_app else CSP
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['Cache-Control'] = 'no-store'
+    return response
+
+
+@app.get('/health')
+async def health():
+    return {'ready': True, 'warmed': show.warm, 'recording': show.recording, 'build': show.build['id']}
+
+
+@app.get('/stage')
+@app.get('/stage/keys')
+@app.get('/stage/models')
+async def page(request: Request):
+    if request.url.path == '/stage' and free_mode.active:
+        return RedirectResponse('/free', status_code=307)
+    return FileResponse(STATIC / 'index.html')
+
+
+@app.get('/stage/assets/{name}')
+async def asset(name: str):
+    if name not in ('stage.js', 'stage.css', 'window-controls.js', 'economics.js', 'zgx-i18n.js'):
+        raise HTTPException(404)
+    return FileResponse(STATIC / name)
+
+
+@app.get('/stage/api/state')
+async def state():
+    return show.snapshot()
+
+
+@app.get('/stage/api/events')
+async def events(request: Request):
+    async def stream():
+        while not await request.is_disconnected():
+            yield 'data: ' + json.dumps(show.snapshot(), ensure_ascii=False) + '\n\n'
+            await asyncio.sleep(.15)
+    return StreamingResponse(stream(), media_type='text/event-stream')
+
+
+class Command(BaseModel):
+    action: Literal['next', 'back', 'backup', 'reset', 'reset_segment', 'rehearse', 'settings', 'viewport', 'retry']
+    audio: bool | None = None
+    projector_boost: bool | None = None
+    require_backups: bool | None = None
+    width: int = 0
+    height: int = 0
+
+
+@app.post('/stage/api/control')
+async def control(command: Command):
+    if (free_mode.active or free_mode.switching) and command.action != 'viewport':
+        raise HTTPException(409, 'Free Mode owns the models. Return to Presenter Mode from the Free Mode navigation first.')
+    show.journal('control', action=command.action)
+    if command.action == 'next':
+        await show.next()
+    elif command.action == 'retry':
+        await show.retry_current()
+    elif command.action == 'back':
+        show.view = max(-1, show.view - 1)
+    elif command.action == 'backup':
+        if show.view >= 0:
+            row = show.current()
+            if row['backup']:
+                row['backup'] = False
+            else:
+                verified = any(item['ok'] and item['label'] == BEATS[show.view] + ' backup' for item in show.backup_checks())
+                if not verified:
+                    raise HTTPException(409, 'No verified recording is available for this scene. Live results remain on screen.')
+                await show.failover(BEATS[show.view], 'Presenter selected backup')
+    elif command.action in ('reset', 'reset_segment'):
+        await show.reset(command.action == 'reset_segment')
+    elif command.action == 'rehearse':
+        if show.view != -1 or show.resetting or (show.warm_task and not show.warm_task.done()):
+            raise HTTPException(409, 'Return to Ready and finish preparation before rehearsing')
+        show.warm = False
+        show.warm_task = asyncio.create_task(show.warmup(full=True))
+    elif command.action == 'settings' and show.view == -1:
+        if command.audio is not None and command.audio != show.settings['audio']:
+            if not show.warm:
+                raise HTTPException(409, 'Wait for the current warm-up before changing the audio setting')
+            show.settings['audio'] = command.audio
+            show.warm = show.full_warm_complete = False
+            show.warm_task = asyncio.create_task(show.warmup())
+        for key in ('audio', 'projector_boost', 'require_backups'):
+            if (value := getattr(command, key)) is not None:
+                show.settings[key] = value
+    elif command.action == 'viewport':
+        show.viewport = {'width': command.width, 'height': command.height}
+    return show.snapshot()
+
+
+@app.get('/stage/api/models')
+async def models():
+    result = []
+    async with httpx.AsyncClient(trust_env=False, timeout=2) as client:
+        for name, lane in CONFIG['lanes'].items():
+            item = dict(lane)
+            item['ready'] = show.health.get(name, {}).get('ready', False)
+            try:
+                if name in ('lead', 'text'):
+                    data = (await client.get(f'http://127.0.0.1:{lane["port"]}/v1/models')).json()
+                    item['parameters'] = data['data'][0]['meta']['n_params'] + item.get('projector_parameters', 0)
+                elif name == 'image':
+                    item['parameters'] = show.health['image']['parameter_count']
+                else:
+                    data = (await client.get(f'http://127.0.0.1:{lane["port"]}/gb10/memory')).json()
+                    item['parameters'] = data['parameters']
+            except (httpx.HTTPError, ValueError, KeyError):
+                item['parameters'] = None
+            result.append(item)
+    return {'models': result, 'parameters_loaded': sum(item['parameters'] for item in result if item['ready'] and item['parameters'])}
+
+
+@app.get('/stage/api/pricing')
+async def pricing():
+    return json.loads((ROOT / 'config/event-pricing.json').read_text()).get('gb10', {})
+
+
+class VideoFrame(BaseModel):
+    run_id: str
+    at: float
+    media_time: float
+
+
+@app.post('/stage/api/control-frame')
+async def video_frame(frame: VideoFrame):
+    row = show.current()
+    if not row or frame.run_id != row['id']:
+        raise HTTPException(409)
+    show.journal('backup_first_frame', run_id=frame.run_id, media_time=frame.media_time,
+                 latency_seconds=frame.at - row.get('failover_at', frame.at))
+    return {'ok': True}
+
+
+@app.get('/stage/backup/{segment}.mp4')
+async def backup(segment: str):
+    if segment not in BEATS or not (path := STATE / 'backup' / (segment + '.mp4')).is_file():
+        raise HTTPException(404)
+    return FileResponse(path, media_type='video/mp4')
+
+
+@app.get('/stage/sample/{name}')
+async def sample(name: str):
+    if name not in ('whiteboard.png', 'chart.png'):
+        raise HTTPException(404)
+    return FileResponse(ROOT / 'samples/stage/vision' / name)
+
+
+@app.get('/stage/creative/{name}')
+async def creative(name: str):
+    if not re.fullmatch(r'[a-f0-9]{32}(?:-[1-4])?\.png', name):
+        raise HTTPException(404)
+    path = STATE / 'creative' / name
+    if not path.is_file() or path.is_symlink():
+        raise HTTPException(404)
+    return FileResponse(path)
+
+
+@app.get('/stage/artifact/{run_id}/{segment}/{name}')
+async def artifact(run_id: str, segment: str, name: str):
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', run_id) or segment not in BEATS or name not in ('calculator.html', 'briefing.html', 'calculator.png', 'pilot-image-kit.zip', 'summary.pcm', 'voice.pcm', 'slide-1.svg', 'slide-2.svg', 'slide-3.svg', 'slide-4.svg', 'slide-5.svg'):
+        raise HTTPException(404)
+    path = STATE / 'outputs' / run_id / segment / name
+    if not path.is_file() or path.is_symlink():
+        raise HTTPException(404)
+    return FileResponse(path, filename='Northwind-pilot-image-kit.zip') if name == 'pilot-image-kit.zip' else FileResponse(path)
+
+
+@app.get('/stage/logo')
+async def logo():
+    # Use the supplied HP keyline artwork, never a text approximation.
+    return FileResponse(ROOT / 'showcase_app/assets/hp-logo-keyline.png', media_type='image/png')
+
+
+@app.get('/stage/agent-art')
+async def agent_art():
+    path = ROOT / 'state/brand/nano-agent.png'
+    if not path.is_file() or path.is_symlink():
+        supplied = ROOT / 'showcase_app/assets/nano-agent.png'
+        if supplied.is_file():
+            return FileResponse(supplied, media_type='image/png')
+        return FileResponse(ROOT / 'showcase_app/free_mode/agent.svg', media_type='image/svg+xml')
+    return FileResponse(path, media_type='image/png')

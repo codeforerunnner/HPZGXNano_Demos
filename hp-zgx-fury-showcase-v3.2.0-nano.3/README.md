@@ -1,0 +1,141 @@
+# HP ZGX Nano Collective
+
+Seven interactive local AI experiences and a fast-starting Executive Stage on the HP ZGX Nano / NVIDIA GB10, with the supplied official HP logo, original robot artwork and the complete portable installer.
+
+**Nano preview v3.2.0-nano.3** · Ubuntu 24.04 ARM64 · 128 GB unified memory · working NVIDIA driver/CUDA toolkit · 200 GiB free installation space. Selected model files: about 95.9 GiB. This is a community demonstration, not an officially supported or endorsed HP or NVIDIA product.
+
+```bash
+git clone --branch v3.2.0-nano.3 --depth 1 \
+  https://github.com/Navigatedhustle/hp-zgx-fury-showcase.git hp-zgx-nano
+cd hp-zgx-nano
+./install.sh
+./launch.sh free
+```
+
+Open **http://127.0.0.1:18808/free**, or use the installed **HP ZGX Nano Experience** desktop/application shortcut. Switch to Presenter Mode from the sidebar, or run `./launch.sh stage`. With models already resident, the current source reliability checks prepared the stage in about 7–9 seconds; cold install/model loading is separate. Full rehearsal and verified-recording protection remain available explicitly. Use **Back to Free Mode** in the presenter header or on step 05 to end the show and return directly to the hub.
+
+Presenter images now support the fictional Northwind pilot proposal: a generated cover embedded in the briefing and a downloadable four-image kit for the CIO briefing, private workspace, team workshop and pilot planning. Each image is reviewed locally for subject relevance and unwanted lettering before release. [Contextual-image verification](docs/verification/nano_contextual_images.json).
+
+`./install.sh --check` inspects prerequisites; `./install.sh --no-desktop` supports headless preparation. Setup downloads pinned dependencies and model files and verifies their recorded hashes. It never replaces a driver, changes networking or disables a sandbox. Only one model stack should run on this GPU.
+
+[Fresh Nano quickstart](docs/NANO_QUICKSTART.md) · [Quickstart PDF](https://github.com/Navigatedhustle/hp-zgx-fury-showcase/releases/download/v3.2.0-nano.3/HP-ZGX-Nano-Quickstart.pdf) · [Complete guide](docs/NANO_GUIDE.md) · [Complete guide PDF](https://github.com/Navigatedhustle/hp-zgx-fury-showcase/releases/download/v3.2.0-nano.3/HP-ZGX-Nano-Complete-Guide.pdf) · [Download the share kit](https://github.com/Navigatedhustle/hp-zgx-fury-showcase/releases/download/v3.2.0-nano.3/HP-ZGX-Nano-v3.2.0-nano.3-share-kit.zip)
+
+The final presenter scene now scales measured text tokens across **10 customers per employee per day × 200 employees × 30 days × 12 months**, with persistent monthly/yearly frontier API and Nano electricity charts. Electricity assumptions are editable and official pricing sources are linked. [Economics verification](docs/verification/nano_economics.json).
+
+![Closing cost comparison — illustrative token counts](docs/screenshots/nano-economics.png)
+
+*Layout example with explicitly illustrative token counts; actual runs use their own recorded ledger. Electricity is an assumed 200-device fleet, not a wall-power measurement. Annual costs hold the dated rates constant.*
+
+![Nano Collective experience center](docs/screenshots/nano-collective.png)
+
+This is a functional Nano preview, not full keynote qualification. The current source reliability pass completed two normal five-scene shows, recovered a third show from a deliberately stopped image service while retaining five completed Rush results, and completed all seven Free Mode experiences. No ten-show or 45-minute idle qualification is claimed. [Reliability fixes and verification](docs/verification/nano_reliability.json).
+
+---
+
+# Fury / GB300 reference
+
+Eight local AI experiences share one GB300 workstation, with real model routing, visible queues and measured hardware telemetry. V3 is a review branch; no V3 tag or release is published. Existing releases remain immutable.
+
+This community demonstration uses fictional business data. HP and NVIDIA names identify the tested hardware; this project is not an officially supported or endorsed HP or NVIDIA product. Their marks remain their owners' property.
+
+```bash
+git clone --branch v3 https://github.com/Navigatedhustle/hp-zgx-fury-showcase.git
+cd hp-zgx-fury-showcase
+./launch.sh
+```
+
+Open **http://localhost:8080**. Mission Control provides eight launch cards, retained workspaces, model lanes, jobs, a Model Hub, performance history and sourced cloud cost scenarios. **Fury Rush** submits six real workflows through their original controls: Factory, Atlas, Presentations, Vision, Translate and Image Studio. Work remains bounded by the existing queues.
+
+| Experience | Local address | What to demonstrate |
+|---|---|---|
+| Atlas | http://localhost:8200 | Ask how an 8 percentage point Commit win-rate drop changes Q4 profit. Inspect synthetic grounding, the real audio-reactive orb and executive export. |
+| Presentations | http://localhost:8765/booth | Generate three slides from a brief; inspect and download editable PowerPoint. Full editor retained. |
+| Agent Factory | http://localhost:8501/devteam | Automatic short Live build: real local development, sandbox tests, functional preview and visual acceptance. Guided mode is clearly labeled recorded playback. |
+| Image Studio | http://localhost:8800 | Five styles, four ratios, seed and sequential batches of 1/2/4. Download or Send to Video. |
+| Vision Lab | http://localhost:8080/experience/vision | Five original fictional image samples; actual Qwen extraction followed by a lead-lane executive brief. |
+| Translate Desk | http://localhost:8080/experience/translate | PDF, DOCX or TXT into 34 language choices, page navigation and PDF/DOCX/TXT downloads. |
+| Video Studio | http://localhost:8080/experience/video | True text-to-video or reference image-to-video: 121 frames at 24 fps, 1280×704 or 832×480. |
+| Action Trailer | http://localhost:8080/experience/trailer | Consent, camera capture, an original three-shot PG screenplay, reference keyframes, local clips, narration and soundtrack. |
+
+Translate uses **clean text reflow**, with advisory terminology review; original document layout is not preserved. Every extracted text line, number and product code is checked before completion. Scanned PDFs require OCR and are rejected; fictional document images can be tried in Vision. Language quality varies and needs human review.
+
+Video uses the pinned Wan2.2 TI2V 5B backbone with named Apache-2.0 LongLive-Plug adapters, four inference steps and CFG 1. No model is silently substituted. The proven video preset is five seconds; trailer assembly may visibly cut to two shots when its time budget is exceeded. Fullscreen playback with sound needs a user tap.
+
+Action Trailer is the only real visitor-photo workflow. Consent precedes camera access. Photos and generated media stay in per-session storage outside the repository, are processed only by local models, and are deleted on Done, New visitor, explicit deletion, 15 minutes idle and service startup. Polling does not extend retention. The browser receives a private preview; final download is restricted to localhost on the station. Use localhost or an operator-configured private HTTPS context for camera access. Vision and other uploads are for fictional/public demonstration material.
+
+**Tested host:** Ubuntu 24.04 ARM64, NVIDIA GB300 with 256703 MiB HBM and **494.15 GiB usable physical Grace memory (NUMA node 0)**. Linux reports about 743.65 GiB aggregate memory because it includes HBM as NUMA node 1. That aggregate is not physical Grace capacity. Preflight requires at least 480 GiB physical Grace and 700 GiB combined Linux-visible capacity. Other hardware/platforms are unverified. Reserve 350 GiB free disk initially; model assets total about **227.566 GiB**, plus dependencies, compiler caches and generated outputs. [Prerequisites](docs/PREREQUISITES.md).
+
+Setup creates pinned local environments, verifies model files, builds the editor and waits for service readiness. First installation and cold NVIDIA compilation need internet and can take tens of minutes. Subsequent launches reuse caches and identity-checked healthy services. No GPU driver, kernel, firewall, networking or boot-service changes are made. Weights, environments, runtime databases, cookies, photos and private evidence are excluded from Git and source archives.
+
+```bash
+./launch.sh status
+./launch.sh diagnostics          # local operational details; review before sharing
+./launch.sh recover agent        # guarded recovery after workloads are idle
+./launch.sh stop                 # identity-checked shutdown
+./launch.sh setup                # resume interrupted setup
+./launch.sh desktop              # optional desktop shortcut
+```
+
+DeepSeek retains its 16K context and one sequence; Qwen retains its 65K context and four sequences. Gateway admission remains four total, three ordinary and one reserved for Atlas. Factory admits one build and at most two development calls. FLUX and Wan share one creative process and one active GPU slot, with three queue slots; idle modules are offloaded to physical Grace. The 10 GiB HBM reserve is preserved. Short lead requests visibly route to Qwen when DeepSeek is busy, with requested/actual model and reason in the ledger.
+
+Telemetry comes from native GPU/CPU/memory counters and vLLM output-token deltas, using one shared collector and cached SSE. External AI requests count instrumented gateway destinations, not all machine traffic. Cloud vs Local includes a [frontier API cost bar chart](docs/CLOUD-COMPARISON.md) with editable whole-system power, runtime and tariff assumptions; provider electricity stays bundled into API prices. Measured session energy is GPU-only; electricity is not total ownership cost. Cloud prices are dated official scenarios with output/capability differences disclosed. [Architecture](docs/ARCHITECTURE.md) · [Verification](docs/V3_VERIFICATION.md).
+
+Conference stations remain at `/stations`; assignments belong to each browser. Use the actual CSS viewport at 100% zoom, principally 1366×768, plus 1280×720, 1440×900, 1920×1080 and shorter laptop cases. Workspaces use contained scrolling. Fullscreen is optional.
+
+**Customer Skin** makes presenter controls and settings available directly on every station, without a PIN, presenter code, account or role assignment. Choose **Customize for customer** to research public identity/logo candidates through the local gateway, preview accessible colors and apply across station shells. HP ZGX Fury stays visible; branding stays in ignored `state/skin/`, outside generated apps and downloads. Offline uploads, eight recent confirmed skins and `./launch.sh skin prep|list|clear` support preparation. [Presenter steps and privacy](docs/CUSTOMER_SKIN.md).
+
+**Default appearance** in the left navigation opens the demo with customization bypassed. You can also open `/demos?skin=off`; that browser loads no skin script, styles or API requests, including inside retained workspaces. Optional appearance failures fall back to the native shell without stopping core telemetry.
+
+For the unmerged Customer Skin review build, clone with `git clone --branch customer_skin https://github.com/Navigatedhustle/hp-zgx-fury-showcase.git`. Open Mission Control and use **Customize for customer**, **Presenter guide** or **Assumptions & presenter controls** directly.
+
+Customer Skin remains a draft: its fixed Factory latency acceptance gate did not pass. [Measured results and retained failures](docs/verification/customer_skin.json).
+
+Cloud vs Local separates **USD costs** from **kWh electricity**. Enter sourced, same-workload cloud energy estimates to see how many times more or less electricity they use than one Fury. Missing model-specific energy stays unknown; API prices do not establish energy use.
+
+[Quickstart](QUICKSTART.md) · [Presenter script](docs/PRESENTER.md) · [V3 launch guide](docs/V3_LAUNCH_GUIDE.md) · [Launch PDF](docs/V3_Launch_Guide_v3.0.0.pdf) · [Models and licenses](docs/ASSET-MANIFEST.md) · [Third-party notices](THIRD_PARTY_NOTICES.md) · [Remote access](docs/REMOTE-ACCESS.md) · [MIT source license](LICENSE)
+
+## Upgrade and rollback
+
+Prior releases v2.2.0, v2.1.1, v2.1.0 and v2.0.0 remain available and immutable. V1 also remains available as v1.0.0 (commit e98c85ee26169a6d745de775feea049ae7a3dc63). Preserve runtime outputs and wait until all users/jobs are idle before switching a release. Never start two model stacks on this GPU.
+
+For a Git checkout with clean tracked source:
+
+```bash
+./launch.sh stop
+git fetch --tags origin
+git switch --detach v2.3.0
+./launch.sh
+```
+
+To roll back:
+
+```bash
+./launch.sh stop
+git switch --detach v2.2.0
+./launch.sh setup  # restore the preceding conference release
+./launch.sh
+```
+
+For archive installs, keep the previous release directory and its own environments/output. Stop the current installation through its own launcher, then launch the previous one. Do not copy process registries between directories. Back up outputs first; this UI release changes no application database schema.
+
+V2.0 predates Guided demonstration. Use a fresh browser profile when presenting a prior release; retained recorded artifacts remain recorded and must not be described as newly generated.
+
+## Nano Executive Stage Mode
+
+On GB10, `./launch.sh stage` loads the four pinned local models, runs short measured language, vision, image and voice checks, and opens the local HDMI kiosk at `http://127.0.0.1:18808/stage`. `FURY_PROFILE=gb10` selects the Nano explicitly. The existing Fury profile remains separate.
+
+Prepare actual current backups with `./launch.sh stage record` at native 1920×1080. Fast live start does not require recordings. Enable **Require verified backups** on the Ready screen for a protected show; it blocks until all five backups match this build. Backup creation still runs the complete two-pass rehearsal. `./launch.sh stage rehearse` runs that full rehearsal on demand. Use `./launch.sh stage reset`, `./launch.sh stage status` and `./launch.sh stage stop` for the show session. The stage runs entirely from local assets with the Hugging Face and Transformers offline variables enforced.
+
+Generated cover and gallery images use wordless abstract art direction. Each real render is checked by the local vision lane before display; rejected lettering is never published. The P0 show keeps optional openers and camera segments disabled.
+
+See [the run of show](docs/stage/RUN_OF_SHOW.md), [the checklist](docs/stage/STAGE_CHECKLIST.md) and [the memory qualification](docs/verification/gb10_gate1.md). The [native stage proof](docs/verification/gb10_stage_gate_report.json) records ten consecutive live shows, offline socket capture, all five controlled failovers and the 45 minute idle check. Event settings, recordings, outputs and optional private branding stay in ignored `state/` and are excluded from source distributions.
+
+The Nano Collective skin uses the unchanged owner-supplied HP Electric Blue keyline logo, cyan-lit navy panels, original robot agent illustrations, the bundled decorative robot hero, and five original briefing slide compositions. The hero is supplied interface artwork, not a demo-model inference output. Every candidate image is checked locally before display; lettering rejection is visible and bounded. The full briefing and its previews use the same escaped vector layouts.
+
+## Nano Free Mode
+
+Run `./launch.sh free` and open **http://127.0.0.1:18808/free** for a Fury V3-style interactive hub alongside the sequential presenter workflow. Atlas, Presentations, Agent Factory, Image Studio, Vision Lab and Translate Desk accept your own inputs; Voice Studio exposes local Kokoro narration. Retained workspaces, live progress, a shared queue, Model Hub, editable PowerPoint, downloads and six-workflow Nano Rush use the same resident Nano models.
+
+Free Mode adapts the original experiences to the Nano: Atlas is an account-grounded assistant and Factory builds self-contained browser apps. Video Studio and Action Trailer are excluded because no video model is loaded. Modes share one stack and reject overlapping presenter/free workloads. Return to Presenter Mode from the sidebar after jobs finish; the short functional checks run again before readiness. [Controls, capability differences and limits](docs/FREE_MODE.md).
+
+The [Nano Collective UI verification](docs/verification/nano_collective_ui.json) records functional startup timing, responsive and accessibility checks, and one live five-beat run. This is distinct from full event qualification.

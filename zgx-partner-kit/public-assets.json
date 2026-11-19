@@ -1,0 +1,51 @@
+[
+  {
+    "file": "en_US-ljspeech-medium.onnx",
+    "url": "https://huggingface.co/rhasspy/piper-voices/resolve/5041a7a49ae5b3a0f30e6837769eb03fdbb231bd/en/en_US/ljspeech/medium/en_US-ljspeech-medium.onnx",
+    "sha256": "6f52a751e2349abe7a76735eb09dc1875298c77ea2342ffd2fef79ff81b87f22",
+    "role": "speech",
+    "bytes": 63531379
+  },
+  {
+    "file": "en_US-ljspeech-medium.onnx.json",
+    "url": "https://huggingface.co/rhasspy/piper-voices/resolve/5041a7a49ae5b3a0f30e6837769eb03fdbb231bd/en/en_US/ljspeech/medium/en_US-ljspeech-medium.onnx.json",
+    "sha256": "141d612cc0a95ed7efc1ca936b845c2364967f2e9217c5dbfcf69fc4d6c65860",
+    "role": "speech",
+    "bytes": 4972
+  },
+  {
+    "file": "es_ES-carlfm-x_low.onnx",
+    "url": "https://huggingface.co/rhasspy/piper-voices/resolve/5041a7a49ae5b3a0f30e6837769eb03fdbb231bd/es/es_ES/carlfm/x_low/es_ES-carlfm-x_low.onnx",
+    "sha256": "d69677323a907cd4963f42b29c20a98b5d6bfa7f3e64df339915e4650c00d125",
+    "role": "speech",
+    "bytes": 28130791
+  },
+  {
+    "file": "es_ES-carlfm-x_low.onnx.json",
+    "url": "https://huggingface.co/rhasspy/piper-voices/resolve/5041a7a49ae5b3a0f30e6837769eb03fdbb231bd/es/es_ES/carlfm/x_low/es_ES-carlfm-x_low.onnx.json",
+    "sha256": "d9bdfa9ff01eb2bc9e62e7d2593939d1e4c4d8eb7cf75f972731539d12399966",
+    "role": "speech",
+    "bytes": 4159
+  },
+  {
+    "file": "ggml-base.bin",
+    "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin",
+    "sha256": "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
+    "role": "speech",
+    "bytes": 147951465
+  },
+  {
+    "file": "rf-detr-nano.pth",
+    "url": "https://storage.googleapis.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+    "sha256": "d8d6b9ee57d4d0ed2b1f305163624712a0532cb7bce0c747317984fc5457440d",
+    "role": "vision",
+    "bytes": 366287238
+  },
+  {
+    "file": "coffee.png",
+    "url": "https://raw.githubusercontent.com/scikit-image/scikit-image/v0.25.2/skimage/data/coffee.png",
+    "sha256": "cc02f8ca188b167c775a7101b5d767d1e71792cf762c33d6fa15a4599b5a8de7",
+    "role": "media",
+    "bytes": 466706
+  }
+]
