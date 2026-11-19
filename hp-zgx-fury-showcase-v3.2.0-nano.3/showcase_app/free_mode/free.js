@@ -309,11 +309,11 @@
   }
   async function cancelJob(id) {try {await api(`jobs/${id}/cancel`,{method:'POST',body:'{}'});await poll();toast('Cancellation completed.');}catch(error){toast(error.message);}}
   function openRush() {
-    try {const specs=state.catalog.filter(item=>item.id!=='voice').map(item=>specification(item.id));$('#rush-summary').innerHTML=specs.map(spec=>`<div class="rush-line"><strong>${esc(state.catalog.find(item=>item.id===spec.demo).name)}</strong><span>${esc(spec.prompt)}</span></div>`).join('');$('#rush-dialog').showModal();}catch(error){toast(error.message);}
+    try {const specs=state.catalog.filter(item=>!['voice','heimdall'].includes(item.id)).map(item=>specification(item.id));$('#rush-summary').innerHTML=specs.map(spec=>`<div class="rush-line"><strong>${esc(state.catalog.find(item=>item.id===spec.demo).name)}</strong><span>${esc(spec.prompt)}</span></div>`).join('');$('#rush-dialog').showModal();}catch(error){toast(error.message);}
   }
   $('#confirm-rush').addEventListener('click',async event=>{
     const button=event.currentTarget;button.disabled=true;
-    try {const result=await api('rush',{method:'POST',body:JSON.stringify(state.catalog.filter(item=>item.id!=='voice').map(item=>specification(item.id)))});for(const job of result.jobs){latest[job.demo]=job.id;rendered[job.demo]='';}$('#rush-dialog').close();await poll();showView('jobs');toast('Six real jobs queued. Open any workspace to follow its output.');}catch(error){toast(error.message);}finally{button.disabled=false;}
+    try {const result=await api('rush',{method:'POST',body:JSON.stringify(state.catalog.filter(item=>!['voice','heimdall'].includes(item.id)).map(item=>specification(item.id)))});for(const job of result.jobs){latest[job.demo]=job.id;rendered[job.demo]='';}$('#rush-dialog').close();await poll();showView('jobs');toast('Six real jobs queued. Open any workspace to follow its output.');}catch(error){toast(error.message);}finally{button.disabled=false;}
   });
   async function readDocument(event) {
     const selected=event.target.files[0];if(!selected)return;

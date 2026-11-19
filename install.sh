@@ -8,10 +8,13 @@ if [[ "$(uname -s)" != "Linux" || "$(uname -m)" != "aarch64" ]]; then
   exit 1
 fi
 
-echo "[INFO] 1/2 Instalando Portal de Monitorizacion y Partner Kit (zgx-partner-kit)..."
+echo "[INFO] 1/3 Instalando Partner Kit (zgx-partner-kit)..."
 bash "$ROOT_DIR/zgx-partner-kit/install.sh" "$@"
 
-echo "[INFO] 2/2 Instalando HP ZGX Nano Collective Showcase (hp-zgx-fury-showcase-v3.2.0-nano.3)..."
+echo "[INFO] 2/3 Instalando Portal de Monitorizacion - Fleet Console (fleet-console)..."
+bash "$ROOT_DIR/fleet-console/install.sh"
+
+echo "[INFO] 3/3 Instalando HP ZGX Nano Collective Showcase (hp-zgx-fury-showcase-v3.2.0-nano.3)..."
 SHOWCASE_SRC="$ROOT_DIR/hp-zgx-fury-showcase-v3.2.0-nano.3"
 SHOWCASE_DST="$HOME/hp-zgx-nano"
 
@@ -25,5 +28,5 @@ bash "$SHOWCASE_SRC/install.sh"
 IP_ADDR=$(hostname -I | awk '{print $1}')
 echo ""
 echo "[OK] Instalacion unificada completada."
-echo " - Portal de Monitorizacion y Flota: http://${IP_ADDR:-127.0.0.1}:18888"
+echo " - Portal de Monitorizacion y Flota (Fleet Console): http://${IP_ADDR:-127.0.0.1}:18888"
 echo " - Nano Collective Showcase (Free Mode): http://${IP_ADDR:-127.0.0.1}:18808/free"

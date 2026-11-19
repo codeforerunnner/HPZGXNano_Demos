@@ -26,8 +26,10 @@ Consulta la [Guia y Capturas](docs/README.md) para ver en detalle el funcionamie
 ## Estructura
 
 - `install.sh`: instalador unificado de todo el proyecto.
+- `fleet-console/`: **Portal de Monitorizacion y Flota (`:18888`)** separado (`launcher_web.py`, `install.sh`, `README.md`), con telemetria CPU/GPU/RAM/disco, contador global de tokens/EUR y control de nodos.
 - `hp-zgx-fury-showcase-v3.2.0-nano.3/`: aplicacion principal (`showcase_app`), Free Mode, Presenter Mode, **Heimdall** (orquestador multi-turno con busqueda web IPv4, ejecucion de scripts locales, presentaciones `.pptx` descargables, generacion de aplicaciones, analisis visual, traduccion y sintesis de audio WAV/MP3) y **Voice Studio** (deteccion automatica de idioma espanol/ingles con Piper `es_carlos` y Kokoro-82M `am_michael`/`af_heart`).
-- `zgx-partner-kit/`: consola web de gestion de flota (`launcher_web.py`), medidor de tokens y coste equivalente en EUR por nodo y flota, comprobaciones previas de requisitos y scripts de arranque.
+- `zgx-partner-kit/`: instalador y runtime de las demos publicas (`portable.py`, `public_services.py`, etc.).
+- `docs/`: documentacion y capturas de pantalla.
 
 ## Notas
 

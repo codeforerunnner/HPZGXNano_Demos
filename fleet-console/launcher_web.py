@@ -27,7 +27,10 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-KIT_DIR = Path(__file__).resolve().parent
+PORTAL_DIR = Path(__file__).resolve().parent
+KIT_DIR = Path(os.environ.get("ZGX_KIT_DIR", str(PORTAL_DIR.parent / "zgx-partner-kit")))
+if not (KIT_DIR / "portable.py").exists() and (Path.home() / "zgx-partner-kit" / "portable.py").exists():
+    KIT_DIR = Path.home() / "zgx-partner-kit"
 DEMOS_ROOT = Path(os.environ.get("ZGX_DEMOS_ROOT", str(Path.home() / "zgx-demos")))
 LOG_FILE = DEMOS_ROOT / "launcher-current.log"
 FLEET_FILE = DEMOS_ROOT / "fleet.json"
