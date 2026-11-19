@@ -9,7 +9,7 @@ Documentacion visual de los dos componentes principales del repositorio **HPZGXN
 Servicio systemd: `zgx-launcher.service` (`fleet-console/launcher_web.py`).
 Acceso por defecto: `http://<IP-ZGX>:18888/login` (usuario `admin`).
 
-![HP ZGX Nano Fleet Console](images/fleet-console.png)
+![HP ZGX Nano Fleet Console](images/fleet-console-dashboard.png)
 
 ### Capacidades principales
 - **Monitorizacion de hardware en tiempo real**: CPU, GPU (uso y temperatura), memoria unificada utilizada/total y espacio libre en disco por cada unidad ZGX Nano conectada al Hub.
