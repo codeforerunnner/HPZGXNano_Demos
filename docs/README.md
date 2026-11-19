@@ -6,7 +6,7 @@ Documentacion visual de los dos componentes principales del repositorio **HPZGXN
 
 ## 1. Portal de Monitorizacion y Flota (`HP ZGX Nano - Fleet Console`, puerto `:18888`)
 
-Servicio systemd: `zgx-launcher.service` (`zgx-partner-kit/launcher_web.py`).
+Servicio systemd: `zgx-launcher.service` (`fleet-console/launcher_web.py`).
 Acceso por defecto: `http://<IP-ZGX>:18888/login` (usuario `admin`).
 
 ![HP ZGX Nano Fleet Console](images/fleet-console.png)
