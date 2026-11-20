@@ -29,4 +29,9 @@ if [[ -d "$PWD/custom-overrides/campuscompass-local" && -d "$HOME/zgx-demos/camp
   echo '[OK] Applied bilingual and LAN overrides to campuscompass-local.'
 fi
 
+if [[ -d "$PWD/custom-overrides/research-observatory" && -d "$HOME/zgx-demos/research-observatory" ]]; then
+  cp -r "$PWD/custom-overrides/research-observatory/." "$HOME/zgx-demos/research-observatory/"
+  echo '[OK] Applied layout and overlay overrides to research-observatory.'
+fi
+
 echo '[OK] ZGX Partner Kit demos and public models installed.'

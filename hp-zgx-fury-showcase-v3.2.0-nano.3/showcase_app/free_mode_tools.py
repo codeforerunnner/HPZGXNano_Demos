@@ -5,8 +5,10 @@ from collections import Counter
 import html as _html
 import io
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import urllib.parse
 import wave
@@ -322,14 +324,31 @@ async def translate(job, spec, manager, folder):
 async def voice(job, spec, manager, folder):
     detected_lang = _detect_lang(spec.prompt)
     phase(job, f'Detecting language ({detected_lang}) and synthesizing narration')
-    if detected_lang == 'Spanish':
+    if spec.voice == 'es_carlos':
         chosen_voice = 'es_carlos'
+    elif spec.voice in ('am_michael', 'af_heart'):
+        chosen_voice = spec.voice
     else:
-        chosen_voice = spec.voice if spec.voice in ('am_michael', 'af_heart') else 'am_michael'
+        chosen_voice = 'es_carlos' if detected_lang == 'Spanish' else 'am_michael'
     if chosen_voice == 'es_carlos':
-        piper_bin = Path('/home/iosu/zgx-demos/.public-services/bin/piper')
-        piper_model = Path('/home/iosu/zgx-demos/public-models/es_ES-carlfm-x_low.onnx')
-        if not piper_bin.exists() or not piper_model.exists():
+        piper_bin = next(
+            (Path(p) for p in [
+                os.getenv('FURY_PIPER_BIN', '').strip(),
+                str(Path.home() / 'zgx-demos/.public-services/bin/piper'),
+                str(ROOT / '.venv/bin/piper'),
+                shutil.which('piper') or '',
+            ] if p and Path(p).is_file()),
+            None,
+        )
+        piper_model = next(
+            (Path(p) for p in [
+                os.getenv('FURY_PIPER_MODEL', '').strip(),
+                str(Path.home() / 'zgx-demos/public-models/es_ES-carlfm-x_low.onnx'),
+                str(ROOT / 'models/piper/es_ES-carlfm-x_low.onnx'),
+            ] if p and Path(p).is_file()),
+            None,
+        )
+        if not piper_bin or not piper_model:
             raise ValueError('Piper Spanish voice model is not installed on this unit.')
         proc = await asyncio.create_subprocess_exec(
             str(piper_bin), '--model', str(piper_model), '--output_file', str(folder / 'narration.wav'),
@@ -572,7 +591,7 @@ async def heimdall(job, spec, manager, folder):
         '- images: generate artwork/image (visual prompt, no text).\n'
         '- vision: inspect uploaded image (ONLY if Attached Image = YES).\n'
         '- translate: translate text into ' + spec.language + '.\n'
-        '- voice: short English WAV narration (<850 chars).\n'
+        '- voice: short Spanish or English WAV/MP3 narration (<850 chars).\n'
         'Web Search Allowed: ' + ('YES' if allow_web else 'NO') + '. Attached Image: ' + ('YES' if has_img else 'NO') + '.'
     )
     routed = await language(job, manager, [

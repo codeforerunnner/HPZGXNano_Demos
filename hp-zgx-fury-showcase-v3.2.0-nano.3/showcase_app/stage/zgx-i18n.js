@@ -866,9 +866,12 @@
     if (!root || (root.nodeType !== 1 && root.nodeType !== 3)) return;
     if (root.nodeType === 3) {
       const p = root.parentElement;
-      if (p && (SKIP_TAGS.has(p.tagName) || p.closest("#zgx-i18n-bar, svg, pre, code, textarea"))) return;
+      if (p && (SKIP_TAGS.has(p.tagName) || p.closest("#zgx-i18n-bar, svg, pre, code, textarea, .md-output, .fury-msg-body, .mc-document-text"))) return;
       if (!orig.has(root)) orig.set(root, root.nodeValue);
       const enVal = orig.get(root);
+      if (p && p.tagName === "OPTION" && !p.hasAttribute("value")) {
+        p.setAttribute("value", enVal.trim());
+      }
       const nv = lang === "es" ? translateStr(enVal) : enVal;
       if (root.nodeValue !== nv) root.nodeValue = nv;
       return;
@@ -877,7 +880,7 @@
     const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         const p = node.parentElement;
-        if (!p || SKIP_TAGS.has(p.tagName) || p.closest("#zgx-i18n-bar, svg, pre, code, textarea")) {
+        if (!p || SKIP_TAGS.has(p.tagName) || p.closest("#zgx-i18n-bar, svg, pre, code, textarea, .md-output, .fury-msg-body, .mc-document-text")) {
           return NodeFilter.FILTER_REJECT;
         }
         return NodeFilter.FILTER_ACCEPT;
@@ -887,6 +890,10 @@
     while ((n = w.nextNode())) {
       if (!orig.has(n)) orig.set(n, n.nodeValue);
       const enVal = orig.get(n);
+      const optParent = n.parentElement;
+      if (optParent && optParent.tagName === "OPTION" && !optParent.hasAttribute("value")) {
+        optParent.setAttribute("value", enVal.trim());
+      }
       const nv = lang === "es" ? translateStr(enVal) : enVal;
       if (n.nodeValue !== nv) n.nodeValue = nv;
     }

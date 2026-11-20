@@ -396,11 +396,30 @@ class ProfileLabels(BaseHTTPMiddleware):
 })();
 </script>'''
             import re
+            if args.demo == 'vision':
+                vision_fix_css = (
+                    '<style id="zgx-vision-layout-fix">'
+                    '.lab .feed-card{min-height:0!important}'
+                    '.feed-card{position:relative;display:flex;flex-direction:column;min-height:0!important}'
+                    '.feed-media{position:relative;width:100%;aspect-ratio:16/9;background:#030608;overflow:hidden}'
+                    '.feed-media img,.feed-media video,.feed-card>img,.feed-card>video{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:contain!important;background:#030608}'
+                    '.feed-overlay{position:static!important;border:0!important;border-top:1px solid rgba(92,121,135,.35)!important;border-radius:0!important;background:#060e14!important;padding:10px 12px!important;backdrop-filter:none!important}'
+                    '</style>'
+                )
+                text = text.replace('/static/style.css"', '/static/style.css?v=2"').replace('/static/app.js"', '/static/app.js?v=2"')
+                if '</head>' in text.lower():
+                    text = re.sub(r'(</head>)', lambda m: vision_fix_css + m[0], text, count=1, flags=re.I)
             text = re.sub(r'(<body[^>]*>)',lambda m:m[0]+bar,text,count=1,flags=re.I)
             if '</body>' in text.lower():
                 text = re.sub(r'(</body>)', lambda m: i18n_js + m[0], text, count=1, flags=re.I)
             else:
                 text += i18n_js
+        elif args.demo == 'vision' and 'javascript' in ct and '<div class="feed-media">' not in text:
+            text = text.replace(
+                'return `<article class="feed-card" id="feed-${f.id}">${media}<div class="feed-overlay">',
+                'return `<article class="feed-card" id="feed-${f.id}"><div class="feed-media">${media}</div><div class="feed-overlay">',
+                1,
+            )
         headers = {k:v for k,v in response.headers.items() if k.lower() not in ('content-length','etag')}
         return Response(text,status_code=response.status_code,headers=headers)
 

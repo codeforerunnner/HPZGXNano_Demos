@@ -17,6 +17,8 @@ import shutil
 import signal
 import socket
 import subprocess
+import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -47,6 +49,8 @@ DEFAULT_TOKEN_RATES = {
 TOKEN_LOCK = threading.Lock()
 _LAST_LLAMA_SAMPLE = {"key": None, "in": 0, "out": 0}
 _LAST_NANO_SAMPLE = {"in": 0, "out": 0}
+_LAST_FURY_SAMPLE = {"key": None, "in": 0, "out": 0}
+_LAST_VLLM_SAMPLE = {"key": None, "in": 0, "out": 0}
 _LIVE_TOK_S = {"val": 0.0}
 
 DEFAULT_USER = "admin"
@@ -114,13 +118,73 @@ DEMOS = {
         "route": "/free",
         "req_mem_gib": 96.0,
         "req_ports": [18808, 18000, 18001, 18100, 18204, 18800],
-        "desc_es": "Nueva demo Nano Collective v3.2.0-nano.3 (modo free en :18808/free).",
-        "desc_en": "New Nano Collective v3.2.0-nano.3 showcase (free mode on :18808/free).",
+        "desc_es": "Demo Nano Collective v3.2.0-nano.3: Free Mode (:18808/free) y Presenter Mode (:18808/stage).",
+        "desc_en": "Nano Collective v3.2.0-nano.3 showcase: Free Mode (:18808/free) and Presenter Mode (:18808/stage).",
     },
 }
 
 NANO_COLLECTIVE_DIR = Path.home() / "hp-zgx-nano"
-FURY_DIR = Path.home() / "hp-zgx-fury-showcase"
+
+
+def _resolve_fury_dir() -> Path:
+    candidates = [
+        os.environ.get("ZGX_FURY_DIR", "").strip(),
+        str(PORTAL_DIR.parent / "fury-showcase"),
+        str(Path.home() / "hp-zgx-fury-showcase"),
+    ]
+    for cand in candidates:
+        if cand and (Path(cand) / "launch.sh").exists():
+            return Path(cand)
+    return Path(os.environ.get("ZGX_FURY_DIR", str(PORTAL_DIR.parent / "fury-showcase")))
+
+
+FURY_DIR = _resolve_fury_dir()
+FURY_PROFILES = {
+    "fury-collective": {
+        "name": "Fury Collective v3+",
+        "profile_key": "collective",
+        "tag": "GB300 ALL-IN-ONE V3+",
+        "port": 8080,
+        "route": "/",
+        "req_mem_gib": 240.0,
+        "req_ports": [8080],
+        "desc_es": "Stack completo GB300: DeepSeek-V4-Flash + Qwen3.6-27B + FLUX + Wan2.2 + Agent Factory + Heimdall Fury + Executive Stage.",
+        "desc_en": "Full GB300 stack: DeepSeek-V4-Flash + Qwen3.6-27B + FLUX + Wan2.2 + Agent Factory + Heimdall Fury + Executive Stage.",
+    },
+    "fury-arena": {
+        "name": "Fury Department Arena",
+        "profile_key": "arena-max",
+        "tag": "24x CONCURRENCY QR",
+        "port": 8080,
+        "route": "/experience/arena",
+        "req_mem_gib": 125.0,
+        "req_ports": [8080],
+        "desc_es": "Departamento en una Caja: Qwen3.6-27B a maxima concurrencia (24 seqs) para 15-25 usuarios simultaneos por QR + Data Room OCR.",
+        "desc_en": "Department in a Box: Qwen3.6-27B at maximum concurrency (24 seqs) for 15-25 live QR users + Data Room OCR.",
+    },
+    "fury-ailab": {
+        "name": "Fury AI Lab (LoRA + Dub)",
+        "profile_key": "ai-lab",
+        "tag": "TRAIN + MEDIA",
+        "port": 8080,
+        "route": "/experience/lora",
+        "req_mem_gib": 65.0,
+        "req_ports": [8080],
+        "desc_es": "Fine-tuning LoRA en vivo (>180 GiB HBM3e libres) + Qwen3.6 + Video Dubbing Studio offline ES/EN.",
+        "desc_en": "Live LoRA fine-tuning (>180 GiB free HBM3e) + Qwen3.6 + offline ES/EN Video Dubbing Studio.",
+    },
+    "fury-titan": {
+        "name": "Fury Titan Frontier",
+        "profile_key": "titan",
+        "tag": "FRONTIER NVFP4",
+        "port": 8080,
+        "route": "/experience/warroom",
+        "req_mem_gib": 230.0,
+        "req_ports": [8080],
+        "desc_es": "Modelo unico clase frontier sobre HBM3e + Grace NVLink-C2C con contexto largo para Heimdall, War Room y Data Room.",
+        "desc_en": "Single frontier-class model over HBM3e + Grace NVLink-C2C with long context for Heimdall, War Room and Data Room.",
+    },
+}
 FURY_DEMO = {
     "fury": {
         "name": "HP ZGX Fury Showcase",
@@ -134,18 +198,21 @@ FURY_DEMO = {
 
 WATCH_PORTS = [
     (18888, "ZGX Console"),
+    (8080, "Fury Mission Control"),
+    (8001, "Fury Gateway"),
+    (8000, "Qwen vLLM"),
+    (8100, "DeepSeek/Titan vLLM"),
+    (8200, "Atlas Analytics"),
+    (8202, "ASR Speech"),
+    (8204, "Kokoro TTS"),
+    (8501, "Agent Factory"),
+    (8765, "Presentations"),
+    (8800, "Creative FLUX+Wan"),
     (18000, "CampusCompass"),
     (18110, "Atlas Voice"),
     (18080, "Beat the Guard"),
     (18120, "Research Obs."),
-    (8081, "Qwen 35B LLM"),
-    (8082, "Embeddings"),
-    (8083, "Reranker"),
-    (8110, "Speech (Whisper/Piper)"),
-    (8130, "Vision (RF-DETR)"),
     (11434, "Ollama API"),
-    (8188, "ComfyUI"),
-    (7860, "SD-WebUI"),
 ]
 
 STATE_LOCK = threading.Lock()
@@ -171,8 +238,23 @@ ENROLL_JOB = {
     "running": False,
     "phase": "idle",
     "step": 0,
-    "total_steps": 5,
+    "total_steps": 3,
     "started_at": 0.0,
+    "ended_at": 0.0,
+    "host": "",
+    "ok": None,
+    "error": "",
+    "log": [],
+}
+DEPLOY_LOCK = threading.Lock()
+DEPLOY_JOB = {
+    "running": False,
+    "phase": "idle",
+    "step": 0,
+    "total_steps": 3,
+    "started_at": 0.0,
+    "ended_at": 0.0,
+    "node_id": "",
     "host": "",
     "ok": None,
     "error": "",
@@ -367,6 +449,32 @@ def port_open(port: int, host: str = "127.0.0.1", timeout: float = 0.25) -> bool
         return False
 
 
+def _select_gpu_row(lines: list[str]) -> str:
+    rows = [ln for ln in lines if ln.strip()]
+    if not rows:
+        return ""
+    gpu_env = os.environ.get("FURY_GPU", "").strip()
+    if gpu_env.isdigit() and int(gpu_env) < len(rows):
+        return rows[int(gpu_env)]
+    return next((r for r in rows if "GB300" in r.upper()), rows[0])
+
+
+def _detect_gb300_index() -> str:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"],
+            text=True,
+            timeout=3,
+        )
+        for line in out.splitlines():
+            parts = [p.strip() for p in line.split(",", 1)]
+            if len(parts) == 2 and "GB300" in parts[1].upper():
+                return parts[0]
+    except Exception:
+        pass
+    return ""
+
+
 def build_env() -> dict:
     env = os.environ.copy()
     home = str(Path.home())
@@ -377,6 +485,10 @@ def build_env() -> dict:
     env["PATH"] = f"{extra_path}:{env.get('PATH', '/usr/local/bin:/usr/bin:/bin')}"
     ld = env.get("LD_LIBRARY_PATH", "")
     env["LD_LIBRARY_PATH"] = f"/usr/local/cuda/lib64:{ld}" if ld else "/usr/local/cuda/lib64"
+    if not env.get("FURY_GPU", "").strip():
+        gb300_idx = _detect_gb300_index()
+        if gb300_idx:
+            env["FURY_GPU"] = gb300_idx
     return env
 
 
@@ -451,16 +563,55 @@ def _free_heavy_services() -> None:
     time.sleep(1.0)
 
 
+def _is_fury_key(key: str) -> bool:
+    return key == "fury" or key in FURY_PROFILES
+
+
+def _fury_profile_key_for(key: str) -> str:
+    if key in FURY_PROFILES:
+        return FURY_PROFILES[key]["profile_key"]
+    return "collective"
+
+
+def _active_fury_demo_key() -> str:
+    prof_file = FURY_DIR / "state" / "active-profile.json"
+    if prof_file.is_file():
+        try:
+            pk = json.loads(prof_file.read_text(encoding="utf-8")).get("profile", "collective")
+            for k, meta in FURY_PROFILES.items():
+                if meta["profile_key"] == pk:
+                    return k
+        except Exception:
+            pass
+    return "fury-collective"
+
+
+def _gpu_free_gib() -> float | None:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.free", "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=3,
+        ).strip()
+        if out:
+            row = _select_gpu_row(out.splitlines())
+            if row:
+                return round(float(row.split(",")[-1].strip()) / 1024.0, 1)
+    except Exception:
+        pass
+    return None
+
+
 def preflight_demo(key: str, auto_fix: bool = False) -> dict:
     checks = []
-    meta = FURY_DEMO.get(key) if key == "fury" else DEMOS.get(key)
+    meta = FURY_PROFILES.get(key) or (FURY_DEMO.get(key) if key == "fury" else DEMOS.get(key))
     if not meta:
         return {"ok": False, "key": key, "checks": [], "error": f"Unknown demo: {key}"}
 
     # 1. File / model prerequisites
     req_files = []
-    if key == "fury":
-        req_files = [FURY_DIR / "launch.sh"]
+    if _is_fury_key(key):
+        req_files = [FURY_DIR / "launch.sh", FURY_DIR / "ops/fury-profile.py"]
     elif key == "nano-collective":
         req_files = [
             NANO_COLLECTIVE_DIR / "launch.sh",
@@ -490,14 +641,21 @@ def preflight_demo(key: str, auto_fix: bool = False) -> dict:
     # 2. Clean previous demos / heavy services if auto_fix
     if auto_fix:
         _stop_current_locked()
-        if key == "nano-collective" or _mem_available_gib() < float(meta.get("req_mem_gib", 20.0)):
+        if key == "nano-collective" or _is_fury_key(key) or _mem_available_gib() < float(meta.get("req_mem_gib", 20.0)):
             _free_heavy_services()
 
     # 3. Memory prerequisite
     req_mem = float(meta.get("req_mem_gib", 16.0))
-    avail_gib = _mem_available_gib()
-    mem_ok = avail_gib >= req_mem
-    checks.append({"name": "memory", "ok": mem_ok, "detail": f"MemAvailable {avail_gib} GiB (required >= {req_mem} GiB)"})
+    if _is_fury_key(key):
+        hbm_free = _gpu_free_gib()
+        avail_gib = hbm_free if hbm_free is not None else _mem_available_gib()
+        mem_ok = avail_gib >= min(req_mem, 240.0) if hbm_free is not None else avail_gib >= 64.0
+        mem_lbl = f"HBM3e free {avail_gib} GiB (target ~{req_mem} GiB)" if hbm_free is not None else f"Grace MemAvailable {avail_gib} GiB"
+        checks.append({"name": "memory", "ok": mem_ok, "detail": mem_lbl})
+    else:
+        avail_gib = _mem_available_gib()
+        mem_ok = avail_gib >= req_mem
+        checks.append({"name": "memory", "ok": mem_ok, "detail": f"MemAvailable {avail_gib} GiB (required >= {req_mem} GiB)"})
 
     # 4. Disk prerequisite (>= 2 GB free)
     disk_free_gb = round(shutil.disk_usage("/").free / (1024 ** 3), 1)
@@ -516,9 +674,10 @@ def preflight_demo(key: str, auto_fix: bool = False) -> dict:
 
 
 def start_demo(key: str) -> dict:
-    if key == "fury":
+    if _is_fury_key(key):
         cwd_dir = FURY_DIR
-        cmd = ["bash", str(FURY_DIR / "launch.sh")]
+        profile_key = _fury_profile_key_for(key)
+        cmd = ["python3", "-u", str(FURY_DIR / "ops/fury-profile.py"), "switch", profile_key]
     elif key == "nano-collective":
         cwd_dir = NANO_COLLECTIVE_DIR
         cmd = ["bash", str(NANO_COLLECTIVE_DIR / "launch.sh"), "free"]
@@ -560,6 +719,55 @@ def stop_demo() -> dict:
         _stop_current_locked()
         CURRENT["last_error"] = ""
     return {"ok": True}
+
+
+def _probe_nano_mode() -> str:
+    if not port_open(18808, timeout=0.15):
+        return ""
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open("http://127.0.0.1:18808/free/api/state", timeout=0.6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        mode = data.get("mode", "")
+        return mode if mode in ("free", "presenter") else ""
+    except Exception:
+        return ""
+
+
+def switch_nano_mode(mode: str) -> dict:
+    mode = (mode or "").strip().lower()
+    if mode not in ("free", "presenter"):
+        return {"ok": False, "error": f"Invalid Nano mode: {mode}"}
+    if not port_open(18808, timeout=0.3):
+        return {"ok": False, "error": "ZGX Nano Collective (:18808) is not running. Start it first."}
+    route = "/stage" if mode == "presenter" else "/free"
+    if _probe_nano_mode() == mode:
+        return {"ok": True, "mode": mode, "route": route, "changed": False}
+    endpoint = "/free/api/mode" if mode == "presenter" else "/free/api/presenter-exit"
+    payload = json.dumps({"mode": "presenter"} if mode == "presenter" else {}).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:18808{endpoint}",
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=30.0) as resp:
+            resp.read()
+        return {"ok": True, "mode": mode, "route": route, "changed": True}
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                detail = parsed.get("detail") or parsed.get("error") or ""
+        except Exception:
+            detail = ""
+        return {"ok": False, "error": detail or f"HTTP {exc.code}: could not switch to {mode} mode"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not switch to {mode} mode: {exc}"}
 
 
 def control_service(unit: str, action: str) -> dict:
@@ -868,6 +1076,50 @@ def read_top_procs() -> list:
     return procs
 
 
+def _read_grace_numa() -> dict:
+    try:
+        nodes = [p for p in Path("/sys/devices/system/node").glob("node[0-9]*") if (p / "cpulist").read_text(encoding="utf-8", errors="ignore").strip()]
+        if len(nodes) == 1:
+            vals = {}
+            for line in (nodes[0] / "meminfo").read_text(encoding="utf-8", errors="ignore").splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    vals[parts[2].rstrip(":")] = int(parts[3]) * 1024
+            tot = vals.get("MemTotal", 0)
+            free = vals.get("MemFree", 0)
+            used = max(0, tot - free)
+            if tot > 0:
+                return {
+                    "node": nodes[0].name,
+                    "total_gib": round(tot / (1024 ** 3), 1),
+                    "free_gib": round(free / (1024 ** 3), 1),
+                    "used_gib": round(used / (1024 ** 3), 1),
+                    "pct": round(100.0 * used / tot, 1),
+                }
+    except Exception:
+        pass
+    return {}
+
+
+def _read_highspeed_nics() -> float:
+    max_mbps = 0
+    try:
+        for p in Path("/sys/class/net").iterdir():
+            if p.name == "lo":
+                continue
+            sp = p / "speed"
+            if sp.is_file():
+                try:
+                    val = int(sp.read_text(encoding="utf-8", errors="ignore").strip())
+                    if val > max_mbps:
+                        max_mbps = val
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return round(max_mbps / 1000.0, 1) if max_mbps > 0 else 0.0
+
+
 def collect_system_metrics() -> tuple:
     cpu_pct, per_core = read_cpu_stats()
     cores = os.cpu_count() or 1
@@ -925,24 +1177,29 @@ def collect_system_metrics() -> tuple:
     gpu = {
         "name": "NVIDIA GB10", "util_pct": None, "temp_c": None,
         "power_w": None, "driver": "", "sm_mhz": None, "pstate": "",
+        "hbm_used_gib": None, "hbm_total_gib": None, "hbm_free_gib": None, "hbm_pct": None,
     }
     try:
         out = subprocess.check_output(
             [
                 "nvidia-smi",
-                "--query-gpu=name,driver_version,utilization.gpu,temperature.gpu,power.draw,clocks.current.sm,pstate",
+                "--query-gpu=name,driver_version,utilization.gpu,temperature.gpu,power.draw,clocks.current.sm,pstate,memory.used,memory.total,memory.free",
                 "--format=csv,noheader,nounits",
             ],
             text=True,
             timeout=3,
         ).strip()
         if out:
-            cols = [c.strip() for c in out.splitlines()[0].split(",")]
+            row = _select_gpu_row(out.splitlines())
+            cols = [c.strip() for c in row.split(",")] if row else []
             def _num(val):
                 try:
                     return round(float(val), 1)
                 except Exception:
                     return None
+            hbm_used_mib = _num(cols[7]) if len(cols) > 7 else None
+            hbm_tot_mib = _num(cols[8]) if len(cols) > 8 else None
+            hbm_free_mib = _num(cols[9]) if len(cols) > 9 else None
             gpu = {
                 "name": cols[0],
                 "driver": cols[1] if len(cols) > 1 else "",
@@ -951,6 +1208,10 @@ def collect_system_metrics() -> tuple:
                 "power_w": _num(cols[4]) if len(cols) > 4 else None,
                 "sm_mhz": _num(cols[5]) if len(cols) > 5 else None,
                 "pstate": cols[6] if len(cols) > 6 else "",
+                "hbm_used_gib": round(hbm_used_mib / 1024.0, 1) if hbm_used_mib is not None else None,
+                "hbm_total_gib": round(hbm_tot_mib / 1024.0, 1) if hbm_tot_mib is not None else None,
+                "hbm_free_gib": round(hbm_free_mib / 1024.0, 1) if hbm_free_mib is not None else None,
+                "hbm_pct": round(100.0 * hbm_used_mib / hbm_tot_mib, 1) if hbm_used_mib is not None and hbm_tot_mib else None,
             }
     except Exception:
         pass
@@ -971,6 +1232,8 @@ def collect_system_metrics() -> tuple:
         pass
 
     net = read_net_rates()
+    net["max_speed_gbps"] = _read_highspeed_nics()
+    grace = _read_grace_numa()
     disk_io = read_disk_io()
     top_procs = read_top_procs()
     ports_map = [{"port": p, "label": lbl, "open": port_open(p)} for p, lbl in WATCH_PORTS]
@@ -997,6 +1260,7 @@ def collect_system_metrics() -> tuple:
             "load1": load1, "load5": load5, "load15": load15,
         },
         "ram": ram,
+        "grace": grace,
         "disk": disk,
         "disk_io": disk_io,
         "net": net,
@@ -1079,14 +1343,92 @@ def _probe_nano_collective_tokens() -> tuple:
     return 0, 0
 
 
+def _parse_vllm_metrics_text(body: str) -> tuple:
+    total_in, total_out = 0, 0
+    for line in (body or "").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        if line.startswith("vllm:prompt_tokens_total"):
+            try:
+                total_in += int(float(line.split()[-1]))
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("vllm:generation_tokens_total"):
+            try:
+                total_out += int(float(line.split()[-1]))
+            except (ValueError, IndexError):
+                pass
+    return total_in, total_out
+
+
+def _probe_vllm_metrics(ports: tuple = (8000, 8100)) -> tuple:
+    total_in, total_out = 0, 0
+    for p in ports:
+        if not port_open(p, timeout=0.1):
+            continue
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{p}/metrics", timeout=0.35) as resp:
+                body = resp.read().decode("utf-8", errors="ignore")
+            p_in, p_out = _parse_vllm_metrics_text(body)
+            total_in += p_in
+            total_out += p_out
+        except Exception:
+            pass
+    return total_in, total_out
+
+
+def _probe_fury_operator_tokens() -> tuple:
+    if not port_open(8080, timeout=0.15):
+        return 0, 0, None
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8080/api/live", timeout=0.45) as resp:
+            obj = json.loads(resp.read().decode("utf-8"))
+        if isinstance(obj, dict):
+            totals = obj.get("totals") or {}
+            inp = sum(int(v.get("input", 0) or 0) for v in totals.values() if isinstance(v, dict))
+            out = sum(int(v.get("output", 0) or 0) for v in totals.values() if isinstance(v, dict))
+            tps = (obj.get("telemetry") or {}).get("tokens_per_second")
+            return inp, out, tps
+    except Exception:
+        pass
+    return 0, 0, None
+
+
 def collect_token_metrics(active_key: str | None) -> None:
     if not active_key:
         _LAST_LLAMA_SAMPLE["key"] = None
         _LAST_LLAMA_SAMPLE["in"] = 0
         _LAST_LLAMA_SAMPLE["out"] = 0
+        _LAST_FURY_SAMPLE["key"] = None
+        _LAST_FURY_SAMPLE["in"] = 0
+        _LAST_FURY_SAMPLE["out"] = 0
+        _LAST_VLLM_SAMPLE["key"] = None
+        _LAST_VLLM_SAMPLE["in"] = 0
+        _LAST_VLLM_SAMPLE["out"] = 0
         return
     d_in, d_out = 0, 0
-    if active_key == "nano-collective":
+    if _is_fury_key(active_key):
+        f_in, f_out, f_tps = _probe_fury_operator_tokens()
+        v_in, v_out = _probe_vllm_metrics((8000, 8100))
+        if v_in or v_out:
+            if _LAST_VLLM_SAMPLE["key"] == active_key and v_in >= _LAST_VLLM_SAMPLE["in"] and v_out >= _LAST_VLLM_SAMPLE["out"]:
+                d_in += v_in - _LAST_VLLM_SAMPLE["in"]
+                d_out += v_out - _LAST_VLLM_SAMPLE["out"]
+            elif _LAST_VLLM_SAMPLE["key"] != active_key:
+                d_in += v_in
+                d_out += v_out
+            _LAST_VLLM_SAMPLE.update({"key": active_key, "in": v_in, "out": v_out})
+        elif f_in or f_out:
+            if _LAST_FURY_SAMPLE["key"] == active_key and f_in >= _LAST_FURY_SAMPLE["in"] and f_out >= _LAST_FURY_SAMPLE["out"]:
+                d_in += f_in - _LAST_FURY_SAMPLE["in"]
+                d_out += f_out - _LAST_FURY_SAMPLE["out"]
+            elif _LAST_FURY_SAMPLE["key"] != active_key:
+                d_in += f_in
+                d_out += f_out
+            _LAST_FURY_SAMPLE.update({"key": active_key, "in": f_in, "out": f_out})
+        if f_tps is not None and float(f_tps) > 0:
+            _LIVE_TOK_S["val"] = round(float(f_tps), 1)
+    elif active_key == "nano-collective":
         n_in, n_out = _probe_nano_collective_tokens()
         if n_in >= _LAST_NANO_SAMPLE["in"] and n_out >= _LAST_NANO_SAMPLE["out"]:
             d_in += n_in - _LAST_NANO_SAMPLE["in"]
@@ -1096,7 +1438,6 @@ def collect_token_metrics(active_key: str | None) -> None:
             d_out += n_out
         _LAST_NANO_SAMPLE["in"] = n_in
         _LAST_NANO_SAMPLE["out"] = n_out
-        # Also catch llama-server ports used by nano-collective if /api/economics didn't expose totals
         if d_in == 0 and d_out == 0:
             l_in, l_out = _probe_llama_metrics((18000, 18100))
             if _LAST_LLAMA_SAMPLE["key"] == active_key and l_in >= _LAST_LLAMA_SAMPLE["in"] and l_out >= _LAST_LLAMA_SAMPLE["out"]:
@@ -1115,14 +1456,15 @@ def collect_token_metrics(active_key: str | None) -> None:
             d_in, d_out = l_in, l_out
         _LAST_LLAMA_SAMPLE.update({"key": active_key, "in": l_in, "out": l_out})
     if d_in > 0 or d_out > 0:
-        _LIVE_TOK_S["val"] = round(d_out / 2.0, 1) if d_out > 0 else 0.0
+        if not (_is_fury_key(active_key) and _LIVE_TOK_S["val"] > 0):
+            _LIVE_TOK_S["val"] = round(d_out / 2.0, 1) if d_out > 0 else 0.0
         with TOKEN_LOCK:
             ledger = _load_token_ledger()
             entry = ledger["by_demo"].setdefault(active_key, {"input_tokens": 0, "output_tokens": 0})
             entry["input_tokens"] = int(entry.get("input_tokens", 0)) + d_in
             entry["output_tokens"] = int(entry.get("output_tokens", 0)) + d_out
             _save_token_ledger(ledger)
-    else:
+    elif not _is_fury_key(active_key):
         _LIVE_TOK_S["val"] = 0.0
 
 
@@ -1132,7 +1474,7 @@ def get_token_summary() -> dict:
     rates = ledger.get("rates", dict(DEFAULT_TOKEN_RATES))
     by_demo_out = {}
     tot_in, tot_out = 0, 0
-    all_keys = list(DEMOS.keys()) + ["fury"]
+    all_keys = list(DEMOS.keys()) + list(FURY_PROFILES.keys()) + ["fury"]
     for k in set(all_keys) | set(ledger.get("by_demo", {}).keys()):
         raw = ledger.get("by_demo", {}).get(k, {})
         inp = int(raw.get("input_tokens", 0))
@@ -1204,8 +1546,8 @@ def get_status() -> dict:
         if proc is not None:
             rc = proc.poll()
             if rc is not None:
-                port = FURY_DEMO["fury"]["port"] if key == "fury" else DEMOS[key]["port"]
-                if rc == 0 and key in ("nano-collective", "fury") and port_open(port):
+                port = 8080 if _is_fury_key(key) else DEMOS[key]["port"]
+                if rc == 0 and (key == "nano-collective" or _is_fury_key(key)) and port_open(port):
                     if CURRENT["log_handle"] is not None:
                         try:
                             CURRENT["log_handle"].close()
@@ -1230,10 +1572,10 @@ def get_status() -> dict:
                     CURRENT["status"] = "idle"
                     key = None
             else:
-                port = FURY_DEMO["fury"]["port"] if key == "fury" else DEMOS[key]["port"]
+                port = 8080 if _is_fury_key(key) else DEMOS[key]["port"]
                 CURRENT["status"] = "ready" if port_open(port) else "starting"
-        elif key in ("nano-collective", "fury"):
-            port = FURY_DEMO["fury"]["port"] if key == "fury" else DEMOS[key]["port"]
+        elif key == "nano-collective" or _is_fury_key(key):
+            port = 8080 if _is_fury_key(key) else DEMOS[key]["port"]
             if port_open(port):
                 CURRENT["status"] = "ready"
             else:
@@ -1242,6 +1584,10 @@ def get_status() -> dict:
                 CURRENT["status"] = "idle"
         elif key is None and port_open(18808):
             CURRENT["key"] = "nano-collective"
+            CURRENT["started_at"] = CURRENT["started_at"] or time.time()
+            CURRENT["status"] = "ready"
+        elif key is None and port_open(8080) and (FURY_DIR / "launch.sh").exists():
+            CURRENT["key"] = _active_fury_demo_key()
             CURRENT["started_at"] = CURRENT["started_at"] or time.time()
             CURRENT["status"] = "ready"
         active = {
@@ -1267,11 +1613,21 @@ def get_status() -> dict:
     }
     if hw_model == "ZGX-FURY" or (fury_installed and not any(nano_checks.values())):
         demos_info = {
-            "fury": {**FURY_DEMO["fury"], "installed": fury_installed, "port_listening": port_open(8080)}
+            pk: {
+                **pmeta,
+                "installed": fury_installed,
+                "port_listening": port_open(8080),
+            }
+            for pk, pmeta in FURY_PROFILES.items()
         }
     else:
         demos_info = {
-            k: {**meta, "installed": nano_checks.get(k, False), "port_listening": port_open(meta["port"])}
+            k: {
+                **meta,
+                "installed": nano_checks.get(k, False),
+                "port_listening": port_open(meta["port"]),
+                **({"nano_mode": _probe_nano_mode() if port_open(meta["port"]) else ""} if k == "nano-collective" else {}),
+            }
             for k, meta in DEMOS.items()
         }
     services_info = list_all_services()
@@ -1400,6 +1756,7 @@ def get_fleet_status() -> dict:
         "active": local_st["active"],
         "cpu_pct": local_sys.get("cpu", {}).get("pct", 0),
         "ram": local_sys.get("ram", {}),
+        "grace": local_sys.get("grace", {}),
         "gpu": local_sys.get("gpu", {}),
         "disk": local_sys.get("disk", {}),
         "tokens": local_st.get("tokens", {"total": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "eur_saved": 0.0}, "by_demo": {}}),
@@ -1415,6 +1772,10 @@ def get_fleet_status() -> dict:
             "tag": n.get("tag", "NODE"),
             "host": n["host"],
             "port": n.get("port", 18888),
+            "ssh_port": n.get("ssh_port", 22),
+            "ssh_user": n.get("ssh_user", "iosu"),
+            "arch": n.get("arch", ""),
+            "agent_installed": n.get("agent_installed", True),
             "is_local": False,
             "online": False,
             "latency_ms": None,
@@ -1425,13 +1786,14 @@ def get_fleet_status() -> dict:
             "active": {"key": None, "status": "offline"},
             "cpu_pct": 0,
             "ram": {},
-            "gpu": {},
+            "gpu": {"name": n["gpu"], "util_pct": None} if n.get("gpu") else {},
             "disk": {},
             "tokens": {"total": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "eur_saved": 0.0}, "by_demo": {}},
         }
         try:
             st = _node_http_json(n["host"], n.get("port", 18888), "/api/status", n.get("token", ""), timeout=1.6)
             entry["online"] = True
+            entry["agent_installed"] = True
             entry["latency_ms"] = int((time.time() - t0) * 1000)
             entry["role"] = st.get("role", "node")
             entry["active"] = st.get("active", {})
@@ -1566,6 +1928,7 @@ def _pty_ssh_run(host: str, user: str, password: str, remote_cmd: str, stdin_dat
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "ConnectTimeout=8",
                 "-o", "PubkeyAuthentication=no",
+                "-o", "NumberOfPasswordPrompts=1",
                 f"{user}@{host}",
                 remote_cmd,
             ],
@@ -1573,16 +1936,19 @@ def _pty_ssh_run(host: str, user: str, password: str, remote_cmd: str, stdin_dat
     output = bytearray()
     pw_sent = False
     stdin_sent = False
+    eof = False
     deadline = time.time() + timeout
     try:
         while time.time() < deadline:
-            r, _, _ = select.select([fd], [], [], 0.3)
+            r, _, _ = select.select([fd], [], [], 0.2)
             if r:
                 try:
                     chunk = os.read(fd, 4096)
                 except OSError:
+                    eof = True
                     break
                 if not chunk:
+                    eof = True
                     break
                 output.extend(chunk)
                 low = output[-300:].lower()
@@ -1599,8 +1965,27 @@ def _pty_ssh_run(host: str, user: str, password: str, remote_cmd: str, stdin_dat
                     stdin_sent = True
                 wpid, status = os.waitpid(pid, os.WNOHANG)
                 if wpid == pid:
+                    while True:
+                        r2, _, _ = select.select([fd], [], [], 0.05)
+                        if not r2:
+                            break
+                        try:
+                            chunk = os.read(fd, 4096)
+                        except OSError:
+                            break
+                        if not chunk:
+                            break
+                        output.extend(chunk)
                     code = os.waitstatus_to_exitcode(status)
                     return code, output.decode("utf-8", errors="replace")
+        if eof:
+            reap_deadline = time.time() + 3.0
+            while time.time() < reap_deadline:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    code = os.waitstatus_to_exitcode(status)
+                    return code, output.decode("utf-8", errors="replace")
+                time.sleep(0.05)
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
@@ -1611,6 +1996,108 @@ def _pty_ssh_run(host: str, user: str, password: str, remote_cmd: str, stdin_dat
         try:
             os.close(fd)
         except OSError:
+            pass
+
+
+def _ssh_run(host: str, user: str, password: str, remote_cmd: str, timeout: int = 45, ssh_port: int = 22) -> tuple:
+    try:
+        import paramiko
+    except ImportError:
+        return _pty_ssh_run(host, user, password, remote_cmd, timeout=timeout, ssh_port=ssh_port)
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            host,
+            port=int(ssh_port),
+            username=user,
+            password=password,
+            timeout=min(10, timeout),
+            allow_agent=False,
+            look_for_keys=False,
+            banner_timeout=10,
+            auth_timeout=10,
+        )
+        transport = client.get_transport()
+        if transport:
+            transport.set_keepalive(15)
+        chan = transport.open_session()
+        chan.set_combine_stderr(True)
+        chan.exec_command(remote_cmd)
+        chunks = bytearray()
+        deadline = time.time() + timeout
+        while not chan.exit_status_ready():
+            while chan.recv_ready():
+                chunks.extend(chan.recv(4096))
+            if time.time() >= deadline:
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+                return 124, chunks.decode("utf-8", errors="replace") + "\n[TIMEOUT]"
+            time.sleep(0.05)
+        while chan.recv_ready():
+            chunks.extend(chan.recv(4096))
+        rc = chan.recv_exit_status()
+        chan.close()
+        return rc, chunks.decode("utf-8", errors="replace")
+    except paramiko.AuthenticationException:
+        return 255, "Authentication failed (invalid SSH user or password)."
+    except (TimeoutError, socket.timeout):
+        return 124, "[TIMEOUT]"
+    except Exception as exc:
+        return 255, str(exc)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _ssh_upload_file(host: str, user: str, password: str, local_path: Path, remote_path: str, ssh_port: int = 22, timeout: int = 180) -> tuple:
+    try:
+        import paramiko
+    except ImportError:
+        raw = local_path.read_bytes()
+        if len(raw) > 5 * 1024 * 1024:
+            return False, "paramiko requerido para subir paquetes grandes."
+        b64 = base64.b64encode(raw).decode("ascii")
+        rc, out = _pty_ssh_run(
+            host, user, password,
+            f"mkdir -p \"$(dirname '{remote_path}')\" && echo '{b64}' | base64 -d > '{remote_path}' && echo UPLOAD_OK",
+            timeout=timeout, ssh_port=ssh_port,
+        )
+        return (rc == 0 and "UPLOAD_OK" in out), out[-300:]
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(
+            host,
+            port=int(ssh_port),
+            username=user,
+            password=password,
+            timeout=15,
+            allow_agent=False,
+            look_for_keys=False,
+            banner_timeout=10,
+            auth_timeout=10,
+        )
+        transport = client.get_transport()
+        if transport:
+            transport.set_keepalive(15)
+        sftp = client.open_sftp()
+        sftp.get_channel().settimeout(timeout)
+        sftp.put(str(local_path), remote_path)
+        sftp.close()
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        try:
+            client.close()
+        except Exception:
             pass
 
 
@@ -1625,7 +2112,8 @@ def _enroll_log(msg: str, step: int = None, phase: str = None) -> None:
 
 def get_enroll_status() -> dict:
     with ENROLL_LOCK:
-        elapsed = int(time.time() - ENROLL_JOB["started_at"]) if ENROLL_JOB["started_at"] else 0
+        end_ts = time.time() if ENROLL_JOB["running"] else (ENROLL_JOB.get("ended_at") or time.time())
+        elapsed = int(max(0.0, end_ts - ENROLL_JOB["started_at"])) if ENROLL_JOB["started_at"] else 0
         return {
             "running": ENROLL_JOB["running"],
             "phase": ENROLL_JOB["phase"],
@@ -1639,115 +2127,155 @@ def get_enroll_status() -> dict:
         }
 
 
-def _run_enroll_job(host: str, alias: str, tag: str, port: int, ssh_port: int, role: str, ssh_user: str, ssh_pass: str) -> None:
-    node_token = secrets.token_hex(24)
+def _infer_hw_model_from_gpu(gpu_name: str, fallback: str = "ZGX-NANO") -> str:
+    up = (gpu_name or "").upper()
+    if "GB300" in up:
+        return "ZGX-FURY"
+    if "GB10" in up:
+        return "ZGX-NANO"
+    return fallback or "ZGX-NANO"
+
+
+def _run_enroll_job(host: str, alias: str, tag: str, port: int, ssh_port: int, role: str, ssh_user: str, ssh_pass: str, explicit_token: str = "") -> None:
+    existing = next((n for n in load_fleet() if (n.get("host"), int(n.get("port", 18888))) == (host, port)), None)
+    arch = existing.get("arch", "") if existing else ""
+    gpu_name = existing.get("gpu", "") if existing else ""
+    probed_token = ""
+    remote_hostname = ""
+    agent_ready = False
     try:
-        _enroll_log(f"Conectando por SSH a {ssh_user}@{host}:{ssh_port}...", step=1, phase="SSH Check & Hardware")
-        if not port_open(ssh_port, host=host, timeout=3.0):
-            raise RuntimeError(f"Puerto SSH {host}:{ssh_port} inaccesible.")
+        if ssh_pass:
+            _enroll_log(f"Conectando por SSH a {ssh_user}@{host}:{ssh_port}...", step=1, phase="SSH Check & Hardware")
+            if not port_open(ssh_port, host=host, timeout=3.0):
+                raise RuntimeError(f"Puerto SSH {host}:{ssh_port} inaccesible.")
 
-        probe_cmd = "echo ARCH=$(uname -m); nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^/GPU=/'"
-        c0, out0 = _pty_ssh_run(host, ssh_user, ssh_pass, probe_cmd, timeout=20, ssh_port=ssh_port)
-        if c0 != 0:
-            raise RuntimeError(f"Fallo autenticacion o conexion SSH (code {c0}): {out0[-300:]}")
-        for ln in out0.splitlines():
-            if ln.startswith(("ARCH=", "GPU=")):
-                _enroll_log(f"Detectado: {ln.strip()}")
+            probe_py = """
+import json, pathlib, platform, re, socket, subprocess
+print("ARCH=" + platform.machine())
+print("HOSTNAME=" + socket.gethostname())
+gpus = []
+try:
+    out = subprocess.check_output(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True, timeout=4)
+    gpus = [ln.strip() for ln in out.splitlines() if ln.strip()]
+except Exception:
+    pass
+sel = next((g for g in gpus if "GB300" in g.upper()), next((g for g in gpus if "GB10" in g.upper()), (gpus[0] if gpus else "")))
+print("GPU=" + sel)
+if gpus:
+    print("GPUS=" + ", ".join(gpus))
+svc = "unknown"
+try:
+    r = subprocess.run(["systemctl", "is-active", "zgx-launcher.service"], capture_output=True, text=True, timeout=3)
+    svc = (r.stdout or r.stderr or "").strip() or "inactive"
+except Exception:
+    pass
+print("AGENT_SVC=" + svc)
+home = pathlib.Path.home()
+demos_root = home / "zgx-demos"
+svc_file = pathlib.Path("/etc/systemd/system/zgx-launcher.service")
+if svc_file.exists():
+    try:
+        m = re.search(r"^Environment=ZGX_DEMOS_ROOT=(.+)$", svc_file.read_text(encoding="utf-8", errors="ignore"), re.M)
+        if m:
+            demos_root = pathlib.Path(m.group(1).strip().strip('"'))
+    except Exception:
+        pass
+present = []
+for k, p in [
+    ("campus", demos_root / "campuscompass-local/.venv/bin/python"),
+    ("atlas", demos_root / "atlas-claude/.venv/bin/python"),
+    ("guard", demos_root / "beat-the-guard/.venv/bin/python"),
+    ("vision", demos_root / "research-observatory/.venv/bin/python"),
+    ("nano-collective", home / "hp-zgx-nano/launch.sh"),
+    ("fury-showcase", home / "hp-zgx-fury-showcase/launch.sh"),
+    ("partner-kit", home / "zgx-partner-kit/portable.py"),
+]:
+    if p.exists():
+        present.append(k)
+print("DEMOS_PRESENT=" + (",".join(present) if present else "none"))
+tok = ""
+cfg_path = demos_root / "console-config.json"
+if cfg_path.exists():
+    try:
+        tok = json.loads(cfg_path.read_text(encoding="utf-8")).get("node_token", "")
+    except Exception:
+        pass
+print("NODE_TOKEN=" + tok)
+""".strip()
+            probe_b64 = base64.b64encode(probe_py.encode("utf-8")).decode("ascii")
+            c0, out0 = _ssh_run(host, ssh_user, ssh_pass, f"echo '{probe_b64}' | base64 -d | python3 -", timeout=20, ssh_port=ssh_port)
+            if c0 != 0:
+                raise RuntimeError(f"Fallo autenticacion o conexion SSH (code {c0}): {out0[-300:]}")
+            for ln in out0.splitlines():
+                ln_s = ln.strip()
+                if ln_s.startswith("ARCH="):
+                    arch = ln_s.split("=", 1)[1].strip()
+                    _enroll_log(f"Detectado: ARCH={arch}")
+                elif ln_s.startswith("HOSTNAME="):
+                    remote_hostname = ln_s.split("=", 1)[1].strip()
+                    _enroll_log(f"Detectado: HOSTNAME={remote_hostname}")
+                elif ln_s.startswith("GPU="):
+                    gpu_name = ln_s.split("=", 1)[1].strip()
+                    if gpu_name:
+                        _enroll_log(f"Detectado: GPU={gpu_name}")
+                elif ln_s.startswith(("GPUS=", "AGENT_SVC=", "DEMOS_PRESENT=")):
+                    _enroll_log(f"Detectado: {ln_s}")
+                elif ln_s.startswith("NODE_TOKEN="):
+                    probed_token = ln_s.split("=", 1)[1].strip()
+        else:
+            _enroll_log(f"Equipo ya conocido ({host}); omitiendo SSH y verificando conexion con el agente existente...", step=1, phase="Connection Check")
 
-        _enroll_log("Subiendo paquete launcher_web.py y validando sintaxis Python...", step=2, phase="Upload & Compile")
-        src_b64 = base64.b64encode(Path(__file__).read_bytes()).decode("ascii")
-        up_cmd = f"mkdir -p \"$HOME/zgx-partner-kit\" \"$HOME/zgx-demos\" && echo '{src_b64}' | base64 -d > \"$HOME/zgx-partner-kit/launcher_web.py\" && python3 -m py_compile \"$HOME/zgx-partner-kit/launcher_web.py\" && echo UP_OK"
-        up_b64 = base64.b64encode(up_cmd.encode("utf-8")).decode("ascii")
-        c1, out1 = _pty_ssh_run(host, ssh_user, ssh_pass, f"echo '{up_b64}' | base64 -d | bash -s", timeout=35, ssh_port=ssh_port)
-        if c1 != 0 or "UP_OK" not in out1:
-            raise RuntimeError(f"Fallo subiendo/compilando paquete (code {c1}): {out1[-400:]}")
-        _enroll_log("Paquete validado correctamente (py_compile OK).")
-
-        _enroll_log("Configurando sudoers y servicio systemd zgx-launcher.service...", step=3, phase="Systemd & Sudoers")
-        unit_text = f"""[Unit]
-Description=HP ZGX Nano Fleet Console
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User={ssh_user}
-Group={ssh_user}
-WorkingDirectory=/home/{ssh_user}/zgx-partner-kit
-Environment=HOME=/home/{ssh_user}
-Environment=PYTHONUNBUFFERED=1
-Environment=ZGX_DEMOS_ROOT=/home/{ssh_user}/zgx-demos
-Environment=ZGX_LAUNCHER_HOST=0.0.0.0
-Environment=ZGX_LAUNCHER_PORT=18888
-Environment=ZGX_ROLE={role}
-Environment=ZGX_NODE_TOKEN={node_token}
-ExecStart=/usr/bin/python3 -u /home/{ssh_user}/zgx-partner-kit/launcher_web.py
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-"""
-        unit_b64 = base64.b64encode(unit_text.encode("utf-8")).decode("ascii")
-        sudoers_line = f"{ssh_user} ALL=(root) NOPASSWD: /usr/bin/systemctl start *.service, /usr/bin/systemctl stop *.service, /usr/bin/systemctl restart *.service, /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff, /usr/bin/docker system prune *"
-        sudoers_b64 = base64.b64encode((sudoers_line + "\n").encode("utf-8")).decode("ascii")
-        pw_b64 = base64.b64encode((ssh_pass + "\n").encode("utf-8")).decode("ascii")
-        sys_script = f"""set -e
-echo '{sudoers_b64}' | base64 -d > /tmp/zgx-launcher.sudoers
-echo '{unit_b64}' | base64 -d > /tmp/zgx-launcher.service
-PW=$(echo '{pw_b64}' | base64 -d)
-printf '%s' "$PW" | sudo -S chown root:root /tmp/zgx-launcher.sudoers /tmp/zgx-launcher.service
-printf '%s' "$PW" | sudo -S chmod 440 /tmp/zgx-launcher.sudoers
-printf '%s' "$PW" | sudo -S visudo -cf /tmp/zgx-launcher.sudoers
-printf '%s' "$PW" | sudo -S mv /tmp/zgx-launcher.sudoers /etc/sudoers.d/zgx-launcher
-printf '%s' "$PW" | sudo -S mv /tmp/zgx-launcher.service /etc/systemd/system/zgx-launcher.service
-printf '%s' "$PW" | sudo -S systemctl daemon-reload
-printf '%s' "$PW" | sudo -S systemctl enable --now zgx-launcher.service
-printf '%s' "$PW" | sudo -S systemctl restart zgx-launcher.service
-echo SYS_OK
-"""
-        sys_b64 = base64.b64encode(sys_script.encode("utf-8")).decode("ascii")
-        c2, out2 = _pty_ssh_run(host, ssh_user, ssh_pass, f"echo '{sys_b64}' | base64 -d | bash -s", timeout=40, ssh_port=ssh_port)
-        if c2 != 0 or "SYS_OK" not in out2:
-            raise RuntimeError(f"Fallo configurando systemd/sudoers (code {c2}): {out2[-500:]}")
-        _enroll_log("Servicio zgx-launcher.service activo en el nodo remoto.")
-
-        _enroll_log(f"Verificando API del agente en {host}:{port}...", step=4, phase="Verify Agent")
+        _enroll_log(f"Verificando agente ZGX existente en {host}:{port}...", step=2, phase="Verify Agent")
+        token = probed_token or (existing.get("token", "") if existing else "") or explicit_token
+        hw_model = _infer_hw_model_from_gpu(gpu_name, existing.get("hw_model", tag) if existing else tag)
         st = None
         last_exc = ""
-        for _ in range(8):
-            time.sleep(1.0)
+        if token and port_open(port, host=host, timeout=2.5):
             try:
-                st = _node_http_json(host, port, "/api/status", node_token, timeout=3.0)
-                break
+                st = _node_http_json(host, port, "/api/status", token, timeout=3.0)
+                agent_ready = True
             except Exception as exc:
                 last_exc = str(exc)
-        if st is None:
-            raise RuntimeError(f"El servicio arranco pero no responde en {host}:{port}: {last_exc}")
 
-        hw_model = st.get("system", {}).get("hw", {}).get("hw_model", tag)
-        final_tag = hw_model if tag in ("ZGX-NANO", "ZGX") and hw_model else tag
-        _enroll_log(f"Agente verificado: hw_model={hw_model}, demos={len(st.get('demos', {}))}.")
+        if agent_ready and st:
+            hw_model = st.get("system", {}).get("hw", {}).get("hw_model") or hw_model
+            gpu_from_st = st.get("system", {}).get("gpu", {}).get("name", "")
+            if gpu_from_st:
+                gpu_name = gpu_from_st
+            _enroll_log(f"[OK] Agente ZGX activo y verificado (sin redesplegar): hw_model={hw_model}, demos={len(st.get('demos', {}))}.")
+        else:
+            if not ssh_pass:
+                detail = f": {last_exc}" if last_exc else " (puerto o token no disponible)"
+                raise RuntimeError(f"El agente no responde en {host}:{port}{detail}. Indica la contrasena SSH para verificar o desplegar.")
+            _enroll_log(f"Conexion SSH verificada. Agente ZGX no activo en {host}:{port}; no se ha desplegado nada automaticamente. Usa el boton 'Desplegar' en el portal cuando quieras instalar agente o demos.")
 
-        _enroll_log("Guardando nodo en fleet.json y sincronizando flota P2P...", step=5, phase="Fleet Sync")
-        nodes = [n for n in load_fleet() if (n["host"], n.get("port", 18888)) != (host, port)]
-        node_id = "zgx-" + secrets.token_hex(4)
+        _enroll_log("Guardando nodo en fleet.json y sincronizando flota...", step=3, phase="Fleet Sync")
+        nodes = [n for n in load_fleet() if (n["host"], int(n.get("port", 18888))) != (host, port)]
+        node_id = (existing.get("id") if existing else None) or ("zgx-" + secrets.token_hex(4))
+        final_tag = hw_model if tag in ("ZGX-NANO", "ZGX", "ZGX-FURY") and hw_model else tag
         nodes.append({
             "id": node_id,
-            "alias": alias,
+            "alias": alias or remote_hostname or host,
             "tag": final_tag,
             "hw_model": hw_model,
             "host": host,
             "port": port,
-            "token": node_token,
+            "ssh_port": ssh_port,
+            "ssh_user": ssh_user,
+            "arch": arch,
+            "gpu": gpu_name,
+            "agent_installed": agent_ready,
+            "token": token,
             "role": role,
-            "added_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "added_at": (existing.get("added_at") if existing else None) or time.strftime("%Y-%m-%d %H:%M:%S"),
         })
         save_fleet(nodes)
-        sync_fleet_to_peers()
-        _enroll_log(f"COMPLETADO: {alias} ({hw_model}) registrado con exito.", step=5, phase="Done")
+        if agent_ready:
+            sync_fleet_to_peers()
+        _enroll_log(f"[OK] COMPLETADO: {alias} ({hw_model}) enrolado sin autodespliegue.", step=3, phase="Done")
         with ENROLL_LOCK:
             ENROLL_JOB["ok"] = True
+            ENROLL_JOB["ended_at"] = time.time()
             ENROLL_JOB["running"] = False
     except Exception as exc:
         _enroll_log(f"ERROR: {exc}")
@@ -1755,6 +2283,7 @@ echo SYS_OK
             ENROLL_JOB["ok"] = False
             ENROLL_JOB["error"] = str(exc)
             ENROLL_JOB["phase"] = "Error"
+            ENROLL_JOB["ended_at"] = time.time()
             ENROLL_JOB["running"] = False
 
 
@@ -1767,28 +2296,389 @@ def enroll_node(payload: dict) -> dict:
     role = payload.get("role") if payload.get("role") in ("node", "hub") else "node"
     ssh_user = (payload.get("ssh_user") or "iosu").strip()
     ssh_pass = payload.get("ssh_pass") or ""
+    explicit_token = (payload.get("node_token") or "").strip()
 
     if not host:
         return {"ok": False, "error": "Host / IP requerida."}
-    if not ssh_pass:
-        return {"ok": False, "error": "Contrasena SSH requerida para aprovisionar."}
+    existing = next((n for n in load_fleet() if (n.get("host"), int(n.get("port", 18888))) == (host, port)), None)
+    if not ssh_pass and not existing and not explicit_token:
+        return {"ok": False, "error": "Contrasena SSH requerida para verificar y enrolar un dispositivo nuevo."}
 
     with ENROLL_LOCK:
         if ENROLL_JOB["running"]:
-            return {"ok": False, "busy": True, "error": f"Ya hay un despliegue en curso hacia {ENROLL_JOB['host']}."}
+            return {"ok": False, "busy": True, "error": f"Ya hay un enrolamiento en curso hacia {ENROLL_JOB['host']}."}
         ENROLL_JOB["running"] = True
         ENROLL_JOB["phase"] = "Starting"
         ENROLL_JOB["step"] = 0
-        ENROLL_JOB["total_steps"] = 5
+        ENROLL_JOB["total_steps"] = 3
         ENROLL_JOB["started_at"] = time.time()
+        ENROLL_JOB["ended_at"] = 0.0
         ENROLL_JOB["host"] = f"{host}:{ssh_port}"
         ENROLL_JOB["ok"] = None
         ENROLL_JOB["error"] = ""
-        ENROLL_JOB["log"] = [f"[{time.strftime('%H:%M:%S')}] Iniciando despliegue hacia {host}:{ssh_port}..."]
+        ENROLL_JOB["log"] = [f"[{time.strftime('%H:%M:%S')}] Iniciando registro y prueba de conexion hacia {host}:{ssh_port} (sin autodespliegue)..."]
 
     threading.Thread(
         target=_run_enroll_job,
-        args=(host, alias, tag, port, ssh_port, role, ssh_user, ssh_pass),
+        args=(host, alias, tag, port, ssh_port, role, ssh_user, ssh_pass, explicit_token),
+        daemon=True,
+    ).start()
+    return {"ok": True, "started": True}
+
+
+def _deploy_log(msg: str, step: int = None, phase: str = None) -> None:
+    with DEPLOY_LOCK:
+        if step is not None:
+            DEPLOY_JOB["step"] = step
+        if phase is not None:
+            DEPLOY_JOB["phase"] = phase
+        DEPLOY_JOB["log"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+
+
+def get_deploy_status() -> dict:
+    with DEPLOY_LOCK:
+        end_ts = time.time() if DEPLOY_JOB["running"] else (DEPLOY_JOB.get("ended_at") or time.time())
+        elapsed = int(max(0.0, end_ts - DEPLOY_JOB["started_at"])) if DEPLOY_JOB["started_at"] else 0
+        return {
+            "running": DEPLOY_JOB["running"],
+            "phase": DEPLOY_JOB["phase"],
+            "step": DEPLOY_JOB["step"],
+            "total_steps": DEPLOY_JOB["total_steps"],
+            "elapsed_s": elapsed,
+            "node_id": DEPLOY_JOB["node_id"],
+            "host": DEPLOY_JOB["host"],
+            "ok": DEPLOY_JOB["ok"],
+            "error": DEPLOY_JOB["error"],
+            "log": "\n".join(DEPLOY_JOB["log"][-80:]),
+        }
+
+
+def _deploy_package_sources() -> dict:
+    pkgs = {}
+    if (FURY_DIR / "launch.sh").exists():
+        pkgs["fury-showcase"] = {
+            "key": "fury-showcase",
+            "name": "HP ZGX Fury Showcase",
+            "src_dir": FURY_DIR.resolve(),
+            "remote_rel": "hp-zgx-fury-showcase",
+            "verify_file": "launch.sh",
+            "desc_es": "Codigo showcase Fury (UI i18n, Heimdall, ops y scripts; excluye venv/modelos pesados).",
+            "desc_en": "Fury showcase code (i18n UI, Heimdall, ops and scripts; excludes heavy venv/models).",
+        }
+    if (NANO_COLLECTIVE_DIR / "launch.sh").exists():
+        pkgs["nano-collective"] = {
+            "key": "nano-collective",
+            "name": "ZGX Nano Collective v3.2",
+            "src_dir": NANO_COLLECTIVE_DIR.resolve(),
+            "remote_rel": "hp-zgx-nano",
+            "verify_file": "launch.sh",
+            "desc_es": "Codigo Nano Collective v3.2 (UI i18n, Free/Stage y herramientas; excluye venv/modelos).",
+            "desc_en": "Nano Collective v3.2 code (i18n UI, Free/Stage and tools; excludes venv/models).",
+        }
+    if (KIT_DIR / "portable.py").exists():
+        pkgs["partner-kit"] = {
+            "key": "partner-kit",
+            "name": "ZGX Partner Kit",
+            "src_dir": KIT_DIR.resolve(),
+            "remote_rel": "zgx-partner-kit",
+            "verify_file": "portable.py",
+            "desc_es": "Scripts ZGX Partner Kit (portable.py, public_entry.py; excluye modelos/media).",
+            "desc_en": "ZGX Partner Kit scripts (portable.py, public_entry.py; excludes models/media).",
+        }
+    return pkgs
+
+
+def get_deploy_catalog() -> dict:
+    pkgs = _deploy_package_sources()
+    return {
+        "ok": True,
+        "agent": True,
+        "demos": [
+            {
+                "key": p["key"],
+                "name": p["name"],
+                "desc_es": p["desc_es"],
+                "desc_en": p["desc_en"],
+            }
+            for p in pkgs.values()
+        ],
+    }
+
+
+def _build_demo_tarball(src_dir: Path, pkg_key: str) -> Path:
+    exclude_dirs = {".venv", ".model-venv", ".cache", "models", "logs", "state", "data", "out", "run", "var", "__pycache__", ".git", "node_modules"}
+    exclude_exts = (".gguf", ".safetensors", ".onnx", ".bin", ".pt", ".pth", ".ckpt", ".engine", ".tar.gz")
+    fd, tmp_name = tempfile.mkstemp(prefix=f"zgx-deploy-{pkg_key}-", suffix=".tar.gz", dir="/tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    with tarfile.open(tmp_path, "w:gz") as tf:
+        for root, dirs, files in os.walk(src_dir):
+            dirs[:] = sorted(d for d in dirs if d not in exclude_dirs and not d.startswith(".pytest"))
+            root_p = Path(root)
+            for fn in sorted(files):
+                if fn.endswith(exclude_exts):
+                    continue
+                fp = root_p / fn
+                if fp.is_symlink() and not fp.exists():
+                    continue
+                if not fp.is_file():
+                    continue
+                try:
+                    if fp.stat().st_size > 150 * 1024 * 1024:
+                        continue
+                    arc = str(fp.relative_to(src_dir))
+                    tf.add(str(fp), arcname=arc, recursive=False)
+                except OSError:
+                    continue
+    return tmp_path
+
+
+def _run_deploy_job(node: dict, ssh_user: str, ssh_port: int, ssh_pass: str, deploy_agent: bool, deploy_demos: list) -> None:
+    host = node["host"]
+    port = int(node.get("port", 18888))
+    pkgs = _deploy_package_sources()
+    total_steps = 1 + (1 if deploy_agent else 0) + len(deploy_demos)
+    with DEPLOY_LOCK:
+        DEPLOY_JOB["total_steps"] = max(1, total_steps)
+    cur_step = 0
+    try:
+        cur_step += 1
+        _deploy_log(f"Verificando conectividad SSH con {ssh_user}@{host}:{ssh_port}...", step=cur_step, phase="SSH Check")
+        if not port_open(ssh_port, host=host, timeout=3.0):
+            raise RuntimeError(f"Puerto SSH {host}:{ssh_port} inaccesible.")
+        rc0, out0 = _ssh_run(host, ssh_user, ssh_pass, "echo SSH_OK", timeout=15, ssh_port=ssh_port)
+        if rc0 != 0 or "SSH_OK" not in out0:
+            raise RuntimeError(f"Fallo autenticacion o conexion SSH (code {rc0}): {out0[-300:]}")
+        _deploy_log("[OK] Conexion SSH verificada.")
+
+        if deploy_agent:
+            cur_step += 1
+            _deploy_log("Inspeccionando configuracion existente del agente remoto...", step=cur_step, phase="Deploy Agent")
+            inspect_py = """
+import json, pathlib, re
+home = pathlib.Path.home()
+svc = pathlib.Path("/etc/systemd/system/zgx-launcher.service")
+info = {
+    "script_path": str(home / "zgx-partner-kit/launcher_web.py"),
+    "work_dir": str(home / "zgx-partner-kit"),
+    "demos_root": str(home / "zgx-demos"),
+    "kit_dir": "",
+    "fury_dir": "",
+    "role": "",
+    "token": "",
+}
+if svc.exists():
+    txt = svc.read_text(encoding="utf-8", errors="ignore")
+    m_wd = re.search(r"^WorkingDirectory=(.+)$", txt, re.M)
+    if m_wd:
+        info["work_dir"] = m_wd.group(1).strip().strip('"')
+    m_es = re.search(r"^ExecStart=(.+)$", txt, re.M)
+    if m_es:
+        parts = m_es.group(1).strip().split()
+        py_files = [p for p in parts if p.endswith("launcher_web.py")]
+        if py_files:
+            info["script_path"] = py_files[0]
+            if not m_wd:
+                info["work_dir"] = str(pathlib.Path(py_files[0]).parent)
+    for k, env_k in [("demos_root", "ZGX_DEMOS_ROOT"), ("kit_dir", "ZGX_KIT_DIR"), ("fury_dir", "ZGX_FURY_DIR"), ("role", "ZGX_ROLE")]:
+        me = re.search(rf"^Environment={env_k}=(.+)$", txt, re.M)
+        if me:
+            info[k] = me.group(1).strip().strip('"')
+cfg_p = pathlib.Path(info["demos_root"]) / "console-config.json"
+if cfg_p.exists():
+    try:
+        c = json.loads(cfg_p.read_text(encoding="utf-8"))
+        info["token"] = c.get("node_token", "") or ""
+        if not info["role"] and c.get("role") in ("hub", "node"):
+            info["role"] = c.get("role", "")
+    except Exception:
+        pass
+print(json.dumps(info))
+""".strip()
+            ins_b64 = base64.b64encode(inspect_py.encode("utf-8")).decode("ascii")
+            rc_i, out_i = _ssh_run(host, ssh_user, ssh_pass, f"echo '{ins_b64}' | base64 -d | python3 -", timeout=20, ssh_port=ssh_port)
+            if rc_i != 0:
+                raise RuntimeError(f"Error inspeccionando servicio remoto (code {rc_i}): {out_i[-300:]}")
+            rinfo = json.loads(out_i.strip().splitlines()[-1])
+            remote_script = rinfo["script_path"]
+            remote_workdir = rinfo["work_dir"]
+            remote_demos_root = rinfo["demos_root"]
+            remote_role = rinfo.get("role") or node.get("role") or "node"
+            node_token = rinfo.get("token") or node.get("token") or secrets.token_hex(24)
+
+            _deploy_log(f"Subiendo launcher_web.py a {remote_script}...")
+            _ssh_run(host, ssh_user, ssh_pass, f"mkdir -p '{remote_workdir}' '{remote_demos_root}'", timeout=15, ssh_port=ssh_port)
+            ok_up, err_up = _ssh_upload_file(host, ssh_user, ssh_pass, Path(__file__), remote_script, ssh_port=ssh_port, timeout=60)
+            if not ok_up:
+                raise RuntimeError(f"Fallo subiendo launcher_web.py: {err_up}")
+            rc_c, out_c = _ssh_run(host, ssh_user, ssh_pass, f"python3 -m py_compile '{remote_script}' && echo PY_OK", timeout=20, ssh_port=ssh_port)
+            if rc_c != 0 or "PY_OK" not in out_c:
+                raise RuntimeError(f"Fallo validando sintaxis en nodo remoto: {out_c[-300:]}")
+
+            env_lines = [
+                f"Environment=HOME=/home/{ssh_user}",
+                "Environment=PYTHONUNBUFFERED=1",
+                f"Environment=ZGX_DEMOS_ROOT={remote_demos_root}",
+            ]
+            if rinfo.get("kit_dir"):
+                env_lines.append(f"Environment=ZGX_KIT_DIR={rinfo['kit_dir']}")
+            if rinfo.get("fury_dir"):
+                env_lines.append(f"Environment=ZGX_FURY_DIR={rinfo['fury_dir']}")
+            env_lines.extend([
+                f"Environment=ZGX_LAUNCHER_HOST=0.0.0.0",
+                f"Environment=ZGX_LAUNCHER_PORT={port}",
+                f"Environment=ZGX_ROLE={remote_role}",
+                f"Environment=ZGX_NODE_TOKEN={node_token}",
+            ])
+            unit_text = "[Unit]\nDescription=HP ZGX Fleet Console\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\n"
+            unit_text += f"User={ssh_user}\nGroup={ssh_user}\nWorkingDirectory={remote_workdir}\n"
+            unit_text += "\n".join(env_lines) + "\n"
+            unit_text += f"ExecStart=/usr/bin/python3 -u {remote_script}\nRestart=on-failure\nRestartSec=3\n\n[Install]\nWantedBy=multi-user.target\n"
+            unit_b64 = base64.b64encode(unit_text.encode("utf-8")).decode("ascii")
+            sudoers_line = f"{ssh_user} ALL=(root) NOPASSWD: /usr/bin/systemctl start *.service, /usr/bin/systemctl stop *.service, /usr/bin/systemctl restart *.service, /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff, /usr/bin/docker system prune *"
+            sudoers_b64 = base64.b64encode((sudoers_line + "\n").encode("utf-8")).decode("ascii")
+            pw_b64 = base64.b64encode((ssh_pass + "\n").encode("utf-8")).decode("ascii")
+            sys_script = f"""set -e
+umask 077
+echo '{sudoers_b64}' | base64 -d > /tmp/zgx-launcher.sudoers
+echo '{unit_b64}' | base64 -d > /tmp/zgx-launcher.service
+PW=$(echo '{pw_b64}' | base64 -d)
+printf '%s\\n' "$PW" | sudo -S chown root:root /tmp/zgx-launcher.sudoers /tmp/zgx-launcher.service
+printf '%s\\n' "$PW" | sudo -S chmod 440 /tmp/zgx-launcher.sudoers
+printf '%s\\n' "$PW" | sudo -S chmod 644 /tmp/zgx-launcher.service
+printf '%s\\n' "$PW" | sudo -S visudo -cf /tmp/zgx-launcher.sudoers
+printf '%s\\n' "$PW" | sudo -S mv /tmp/zgx-launcher.sudoers /etc/sudoers.d/zgx-launcher
+printf '%s\\n' "$PW" | sudo -S mv /tmp/zgx-launcher.service /etc/systemd/system/zgx-launcher.service
+printf '%s\\n' "$PW" | sudo -S systemctl daemon-reload
+printf '%s\\n' "$PW" | sudo -S systemctl enable --now zgx-launcher.service
+printf '%s\\n' "$PW" | sudo -S systemctl restart zgx-launcher.service
+echo SYS_OK
+"""
+            sys_b64 = base64.b64encode(sys_script.encode("utf-8")).decode("ascii")
+            _deploy_log("Configurando systemd zgx-launcher.service y reiniciando agente...")
+            rc_s, out_s = _ssh_run(host, ssh_user, ssh_pass, f"echo '{sys_b64}' | base64 -d | bash -s", timeout=45, ssh_port=ssh_port)
+            if rc_s != 0 or "SYS_OK" not in out_s:
+                raise RuntimeError(f"Fallo configurando/reiniciando zgx-launcher.service (code {rc_s}): {out_s[-400:]}")
+
+            st = None
+            last_exc = ""
+            for _ in range(10):
+                time.sleep(1.0)
+                try:
+                    st = _node_http_json(host, port, "/api/status", node_token, timeout=3.0)
+                    break
+                except Exception as exc:
+                    last_exc = str(exc)
+            if st is None:
+                raise RuntimeError(f"El servicio se reinicio pero no responde en {host}:{port}: {last_exc}")
+
+            hw_model = st.get("system", {}).get("hw", {}).get("hw_model", node.get("hw_model", "ZGX"))
+            nodes = load_fleet()
+            for item in nodes:
+                if item.get("id") == node.get("id"):
+                    item["token"] = node_token
+                    item["hw_model"] = hw_model
+                    item["agent_installed"] = True
+                    item["ssh_user"] = ssh_user
+                    item["ssh_port"] = ssh_port
+            save_fleet(nodes)
+            sync_fleet_to_peers()
+            _deploy_log(f"[OK] Agente activo y verificado ({hw_model}, demos={len(st.get('demos', {}))}).")
+
+        for pkg_key in deploy_demos:
+            cur_step += 1
+            meta = pkgs.get(pkg_key)
+            if not meta:
+                raise RuntimeError(f"Paquete de demo no disponible en este Hub: {pkg_key}")
+            _deploy_log(f"Empaquetando demo '{meta['name']}' desde {meta['src_dir']}...", step=cur_step, phase=f"Deploy {pkg_key}")
+            tar_path = _build_demo_tarball(meta["src_dir"], pkg_key)
+            remote_tar = f"/tmp/zgx-deploy-{pkg_key}.tar.gz"
+            try:
+                size_mb = round(tar_path.stat().st_size / (1024 * 1024), 2)
+                _deploy_log(f"Transfiriendo paquete {pkg_key} ({size_mb} MB) hacia {host}...")
+                ok_up, err_up = _ssh_upload_file(host, ssh_user, ssh_pass, tar_path, remote_tar, ssh_port=ssh_port, timeout=300)
+                if not ok_up:
+                    raise RuntimeError(f"Fallo transfiriendo {pkg_key}: {err_up}")
+            finally:
+                try:
+                    tar_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            rel = meta["remote_rel"]
+            vfile = meta["verify_file"]
+            extract_script = f"""set -e
+DEST="$HOME/{rel}"
+if [ -L "$DEST" ]; then
+  DEST="$(readlink -f "$DEST")"
+fi
+mkdir -p "$DEST"
+tar -xzf '{remote_tar}' -C "$DEST"
+rm -f '{remote_tar}'
+test -e "$DEST/{vfile}"
+echo "DEPLOY_DEST=$DEST"
+"""
+            ex_b64 = base64.b64encode(extract_script.encode("utf-8")).decode("ascii")
+            rc_e, out_e = _ssh_run(host, ssh_user, ssh_pass, f"echo '{ex_b64}' | base64 -d | bash -s", timeout=120, ssh_port=ssh_port)
+            if rc_e != 0 or "DEPLOY_DEST=" not in out_e:
+                raise RuntimeError(f"Fallo extrayendo {pkg_key} en {host}: {out_e[-400:]}")
+            dest_line = next((ln.strip() for ln in out_e.splitlines() if ln.strip().startswith("DEPLOY_DEST=")), "")
+            _deploy_log(f"[OK] Demo {pkg_key} desplegada ({dest_line}).")
+
+        _deploy_log(f"[OK] COMPLETADO: despliegue finalizado en {node.get('alias', host)}.", step=total_steps, phase="Done")
+        with DEPLOY_LOCK:
+            DEPLOY_JOB["ok"] = True
+            DEPLOY_JOB["ended_at"] = time.time()
+            DEPLOY_JOB["running"] = False
+    except Exception as exc:
+        _deploy_log(f"ERROR: {exc}")
+        with DEPLOY_LOCK:
+            DEPLOY_JOB["ok"] = False
+            DEPLOY_JOB["error"] = str(exc)
+            DEPLOY_JOB["phase"] = "Error"
+            DEPLOY_JOB["ended_at"] = time.time()
+            DEPLOY_JOB["running"] = False
+
+
+def deploy_to_node(payload: dict) -> dict:
+    node_id = (payload.get("node_id") or "").strip()
+    ssh_pass = payload.get("ssh_pass") or ""
+    deploy_agent = bool(payload.get("deploy_agent", False))
+    deploy_demos = [str(k).strip() for k in (payload.get("deploy_demos") or []) if str(k).strip()]
+
+    node = next((n for n in load_fleet() if n.get("id") == node_id), None)
+    if not node:
+        return {"ok": False, "error": "Nodo no encontrado en la flota."}
+    ssh_user = (payload.get("ssh_user") or node.get("ssh_user") or "iosu").strip()
+    ssh_port = int(payload.get("ssh_port") or node.get("ssh_port") or 22)
+    if not ssh_pass:
+        return {"ok": False, "error": "Contrasena SSH requerida para desplegar."}
+    if not deploy_agent and not deploy_demos:
+        return {"ok": False, "error": "Selecciona al menos un componente para desplegar (Agente o una Demo)."}
+
+    pkgs = _deploy_package_sources()
+    for dk in deploy_demos:
+        if dk not in pkgs:
+            return {"ok": False, "error": f"Demo no disponible en este Hub para desplegar: {dk}"}
+
+    with DEPLOY_LOCK:
+        if DEPLOY_JOB["running"]:
+            return {"ok": False, "busy": True, "error": f"Ya hay un despliegue manual en curso hacia {DEPLOY_JOB['host']}."}
+        DEPLOY_JOB["running"] = True
+        DEPLOY_JOB["phase"] = "Starting"
+        DEPLOY_JOB["step"] = 0
+        DEPLOY_JOB["total_steps"] = 1 + (1 if deploy_agent else 0) + len(deploy_demos)
+        DEPLOY_JOB["started_at"] = time.time()
+        DEPLOY_JOB["ended_at"] = 0.0
+        DEPLOY_JOB["node_id"] = node_id
+        DEPLOY_JOB["host"] = f"{node['host']}:{ssh_port}"
+        DEPLOY_JOB["ok"] = None
+        DEPLOY_JOB["error"] = ""
+        DEPLOY_JOB["log"] = [f"[{time.strftime('%H:%M:%S')}] Iniciando despliegue manual hacia {node.get('alias', node['host'])} ({node['host']}:{ssh_port})..."]
+
+    threading.Thread(
+        target=_run_deploy_job,
+        args=(node, ssh_user, ssh_port, ssh_pass, deploy_agent, deploy_demos),
         daemon=True,
     ).start()
     return {"ok": True, "started": True}
@@ -1891,6 +2781,8 @@ def proxy_node_request(node_id: str, sub_path: str, method: str = "GET") -> dict
             return start_demo(sub_path.split("/start/", 1)[1].strip("/"))
         if method == "POST" and sub_path == "/stop":
             return stop_demo()
+        if method == "POST" and sub_path.startswith("/nano-mode/"):
+            return switch_nano_mode(sub_path.split("/nano-mode/", 1)[1].strip("/"))
         if method == "POST" and sub_path == "/free-gpu":
             return free_gpu_action()
         if method == "POST" and sub_path == "/prune-docker":
@@ -2062,7 +2954,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   button.solid { background: var(--hp-blue); border-color: var(--hp-blue); color: #fff; }
   button.warn { background: rgba(210, 153, 34, 0.16); border-color: var(--warn); color: #e3b341; }
   button.danger { background: rgba(248, 81, 73, 0.14); border-color: var(--err); color: #ff7b72; }
-  a.btn.open { background: rgba(46, 160, 67, 0.16); border-color: var(--ok); color: #56d364; }
+  a.btn.open, button.open { background: rgba(46, 160, 67, 0.16); border-color: var(--ok); color: #56d364; }
   button:disabled { opacity: 0.42; cursor: not-allowed; }
 
   /* Fleet view */
@@ -2113,6 +3005,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
     cursor: pointer;
   }
   .scan-row:hover { background: #131e2c; }
+  .deploy-note {
+    background: rgba(0, 150, 214, 0.10); border: 1px solid #1f4466; border-radius: 8px;
+    padding: 9px 12px; font-size: 12px; color: #b7d5ee; margin-bottom: 12px;
+  }
+  .deploy-list { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  .deploy-item {
+    display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px;
+    background: #080d14; border: 1px solid #1b2738; border-radius: 8px; cursor: pointer;
+  }
+  .deploy-item:hover { border-color: #2b4566; }
+  .deploy-item input[type="checkbox"] { margin-top: 3px; width: auto; accent-color: var(--hp-blue); }
+  .deploy-item strong { display: block; font-size: 13px; color: var(--text); }
+  .deploy-item span { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
 
   /* Telemetry & Node Console */
   .telemetry {
@@ -2247,7 +3152,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div class="wrap">
   <header>
     <div class="brand">
-      <div class="badge-hw" onclick="showFleet()">HP ZGX NANO</div>
+      <div class="badge-hw" onclick="showFleet()">HP ZGX</div>
       <div>
         <h1 id="host-title">ZGX Fleet Console</h1>
         <div class="sub" id="host-sub">--</div>
@@ -2328,6 +3233,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         </button>
       </div>
       <div class="btn-row">
+        <button id="btn-node-deploy" class="solid" style="display:none;" onclick="openNodeDeployModal()"></button>
         <button id="btn-free-gpu" class="primary" onclick="freeGpuAction()"></button>
         <button id="btn-prune-docker" class="warn" onclick="pruneDockerAction()"></button>
         <button id="btn-reboot" onclick="powerAction('reboot')"></button>
@@ -2423,14 +3329,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="enroll-modal" class="modal-bg">
   <div class="modal">
     <div class="panel-head">
-      <h2 id="m-title" style="margin:0;">Enrollment de nueva ZGX Nano</h2>
+      <h2 id="m-title" style="margin:0;">Enrolar dispositivo ZGX</h2>
       <button onclick="closeEnrollModal()">X</button>
     </div>
+    <div id="enroll-note" class="deploy-note">Solo prueba la conexion y registra el equipo en la flota. No despliega ni reinicia demos automaticamente; usa el boton Desplegar en el portal cuando quieras instalar o actualizar.</div>
     <div style="display:flex;gap:8px;margin-bottom:10px;align-items:center;flex-wrap:wrap;">
       <input id="scan-cidr" type="text" placeholder="Subred auto (ej. 192.168.1.0/24)" style="flex:1;min-width:180px;background:#080d14;border:1px solid var(--border);color:var(--text);border-radius:7px;padding:7px 10px;">
       <button id="btn-scan" class="primary" onclick="scanNetwork()"></button>
     </div>
-    <div id="scan-results" class="scan-list"><div style="padding:10px;color:var(--muted);font-size:12px;">Pulsa "Escanear red local" para descubrir equipos con SSH (:22) o ZGX Agent (:18888).</div></div>
+    <div id="scan-results" class="scan-list"><div id="scan-hint" style="padding:10px;color:var(--muted);font-size:12px;">Pulsa "Escanear red local" para descubrir equipos con SSH (:22) o ZGX Agent (:18888).</div></div>
     <div class="form-grid">
       <div class="field"><label>IP / Host</label><input id="en-host" type="text" placeholder="192.168.1.xxx"></div>
       <div class="field"><label>SSH Port</label><input id="en-ssh-port" type="number" value="22"></div>
@@ -2439,7 +3346,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="field"><label id="lbl-en-tag">Etiqueta</label><input id="en-tag" type="text" value="ZGX-NANO"></div>
       <div class="field"><label id="lbl-en-role">Rol</label><select id="en-role"><option value="node">Node (Agente)</option><option value="hub">Hub (Principal)</option></select></div>
       <div class="field"><label>SSH User</label><input id="en-user" type="text" value="iosu"></div>
-      <div class="field"><label>SSH Password</label><input id="en-pass" type="password"></div>
+      <div class="field"><label>SSH Password</label><input id="en-pass" type="password" placeholder="Password SSH (opcional si ya esta enrolado)"></div>
     </div>
     <div id="enroll-prog-wrap" style="display:none;margin-bottom:10px;">
       <div class="panel-head" style="margin-bottom:4px;">
@@ -2451,7 +3358,37 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <pre id="enroll-log" style="max-height:160px;margin-bottom:12px;display:none;"></pre>
     <div class="btn-row" style="justify-content:flex-end;">
       <button onclick="closeEnrollModal()" id="btn-en-cancel">Cancelar</button>
-      <button class="solid" id="btn-en-submit" onclick="submitEnroll()">Aprovisionar por SSH y Enrollar</button>
+      <button class="solid" id="btn-en-submit" onclick="submitEnroll()">Enrolar y probar conexion</button>
+    </div>
+  </div>
+</div>
+
+<!-- DEPLOY MODAL -->
+<div id="deploy-modal" class="modal-bg">
+  <div class="modal">
+    <div class="panel-head">
+      <h2 id="dep-title" style="margin:0;">Desplegar en dispositivo</h2>
+      <button onclick="closeDeployModal()">X</button>
+    </div>
+    <div id="dep-target" class="deploy-note">--</div>
+    <div class="form-grid">
+      <div class="field"><label>SSH User</label><input id="dep-ssh-user" type="text" value="iosu"></div>
+      <div class="field"><label>SSH Port</label><input id="dep-ssh-port" type="number" value="22"></div>
+      <div class="field"><label>SSH Password</label><input id="dep-ssh-pass" type="password" placeholder="Password SSH para desplegar"></div>
+    </div>
+    <div class="panel-head" style="margin-bottom:6px;"><h3 id="dep-sel-lbl">Componentes a desplegar</h3></div>
+    <div id="dep-list" class="deploy-list"></div>
+    <div id="deploy-prog-wrap" style="display:none;margin-bottom:10px;">
+      <div class="panel-head" style="margin-bottom:4px;">
+        <span id="deploy-phase" class="port-lbl">Iniciando...</span>
+        <span id="deploy-elapsed" class="port-lbl">0s</span>
+      </div>
+      <div class="bar-track"><div id="deploy-bar" class="bar-fill"></div></div>
+    </div>
+    <pre id="deploy-log" style="max-height:180px;margin-bottom:12px;display:none;"></pre>
+    <div class="btn-row" style="justify-content:flex-end;">
+      <button onclick="closeDeployModal()" id="btn-dep-cancel">Cerrar</button>
+      <button class="solid" id="btn-dep-submit" onclick="submitDeploy()">Desplegar seleccion</button>
     </div>
   </div>
 </div>
@@ -2478,16 +3415,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <script>
 const I18N = {
   es: {
-    subtitle: "Consola de flota y control HP ZGX Nano",
+    subtitle: "Consola de flota y control HP ZGX",
     backFleet: "<- Flota",
     claimMaster: "Reclamar Master (P2P)",
     usersBtn: "Usuarios",
     logout: "Salir",
-    fleetTitle: "Unidades HP ZGX Nano registradas",
-    fleetSub: "Selecciona una unidad para gestionar sus demos, servicios y telemetria, o anade una nueva por SSH.",
-    addNode: "+ Anadir Nano ZGX",
+    fleetTitle: "Unidades HP ZGX registradas",
+    fleetSub: "Selecciona una unidad para gestionar sus demos, servicios y telemetria, o enrola una nueva sin autodespliegue.",
+    addNode: "+ Enrolar ZGX",
     enterNode: "Entrar",
     removeNode: "Quitar",
+    deployBtn: "Desplegar",
+    enrollTitle: "Enrolar dispositivo ZGX",
+    enrollNote: "Solo prueba la conexion y registra el equipo en la flota. No despliega ni reinicia demos automaticamente; usa el boton Desplegar en el portal cuando quieras instalar o actualizar.",
+    enrollSubmit: "Enrolar y probar conexion",
+    deployTitle: "Desplegar en dispositivo",
+    deploySelLbl: "Componentes a desplegar",
+    deployAgentName: "Agente Fleet Console (zgx-launcher.service)",
+    deployAgentDesc: "Instala o actualiza launcher_web.py, sudoers y systemd en el dispositivo.",
+    deploySubmit: "Desplegar seleccion",
+    closeBtn: "Cerrar",
+    cancelBtn: "Cancelar",
     scanBtn: "Escanear red local",
     scanning: "Escaneando red...",
     stopActiveDemo: "Apagar demo activa",
@@ -2522,18 +3470,30 @@ const I18N = {
     confirmResetFleetTok: "Reiniciar contadores de tokens de TODA la flota?",
     tokensLbl: "Tokens", apiEqLbl: "Equiv. API",
     copyLog: "Copiar log", copiedLog: "[OK] Copiado",
+    openFree: "Free Mode", openStage: "Presenter Mode", switchingMode: "Cambiando modo...",
   },
   en: {
-    subtitle: "HP ZGX Nano fleet and node console",
+    subtitle: "HP ZGX fleet and node console",
     backFleet: "<- Fleet",
     claimMaster: "Claim Master (P2P)",
     usersBtn: "Users",
     logout: "Logout",
-    fleetTitle: "Enrolled HP ZGX Nano units",
-    fleetSub: "Select a unit to manage demos, services, and telemetry, or enroll a new one over SSH.",
-    addNode: "+ Add ZGX Nano",
+    fleetTitle: "Enrolled HP ZGX units",
+    fleetSub: "Select a unit to manage demos, services, and telemetry, or enroll a new one without auto-deploy.",
+    addNode: "+ Enroll ZGX",
     enterNode: "Manage",
     removeNode: "Remove",
+    deployBtn: "Deploy",
+    enrollTitle: "Enroll ZGX device",
+    enrollNote: "Tests connection and registers the device in the fleet only. Nothing is auto-deployed or restarted; use the Deploy button in the portal when you want to install or update.",
+    enrollSubmit: "Enroll & Test Connection",
+    deployTitle: "Deploy to device",
+    deploySelLbl: "Components to deploy",
+    deployAgentName: "Fleet Console Agent (zgx-launcher.service)",
+    deployAgentDesc: "Installs or updates launcher_web.py, sudoers and systemd on the target device.",
+    deploySubmit: "Deploy selected",
+    closeBtn: "Close",
+    cancelBtn: "Cancel",
     scanBtn: "Scan local network",
     scanning: "Scanning network...",
     stopActiveDemo: "Stop active demo",
@@ -2568,6 +3528,7 @@ const I18N = {
     confirmResetFleetTok: "Reset token counters for the ENTIRE fleet?",
     tokensLbl: "Tokens", apiEqLbl: "API Eq.",
     copyLog: "Copy log", copiedLog: "[OK] Copied",
+    openFree: "Free Mode", openStage: "Presenter Mode", switchingMode: "Switching mode...",
   }
 };
 
@@ -2597,6 +3558,7 @@ let selectedNodeId = localStorage.getItem("zgx_node") || "";
 let selectedNodeHost = window.location.hostname;
 let currentRole = "hub";
 let lastFleetData = null;
+let fleetNodesById = {};
 let lastNodeData = null;
 let busy = false;
 
@@ -2679,6 +3641,15 @@ function applyStaticLabels() {
   document.getElementById("btn-prune-docker").textContent = t("pruneDocker");
   document.getElementById("btn-reboot").textContent = t("rebootHost");
   document.getElementById("btn-poweroff").textContent = t("poweroffHost");
+  document.getElementById("m-title").textContent = t("enrollTitle");
+  document.getElementById("enroll-note").textContent = t("enrollNote");
+  document.getElementById("btn-en-submit").textContent = t("enrollSubmit");
+  document.getElementById("btn-en-cancel").textContent = t("cancelBtn");
+  document.getElementById("dep-title").textContent = t("deployTitle");
+  document.getElementById("dep-sel-lbl").textContent = t("deploySelLbl");
+  document.getElementById("btn-dep-cancel").textContent = t("closeBtn");
+  document.getElementById("btn-dep-submit").textContent = t("deploySubmit");
+  document.getElementById("btn-node-deploy").textContent = t("deployBtn");
 }
 
 async function api(method, path, body) {
@@ -2779,6 +3750,8 @@ async function removeUserAction(username) {
 }
 
 let enrollTimer = null;
+let deployTimer = null;
+let deployTargetNodeId = "";
 
 async function openEnrollModal() {
   document.getElementById("enroll-modal").classList.add("open");
@@ -2799,7 +3772,7 @@ async function scanNetwork() {
     if (!r.ok) { box.innerHTML = `<div style="padding:10px;color:#ff7b72;font-size:12px;">${r.error}</div>`; return; }
     if (!r.hosts.length) { box.innerHTML = `<div style="padding:10px;color:var(--muted);font-size:12px;">No SSH/ZGX hosts found in ${r.subnet}</div>`; return; }
     box.innerHTML = r.hosts.map(h => `
-      <div class="scan-row" onclick="pickHost('${h.ip}', '${h.hostname || h.ip}')">
+      <div class="scan-row" onclick="pickHost('${h.ip}', '${h.hostname || h.ip}', '${h.hw_model || ''}')">
         <span><strong>${h.ip}</strong> ${h.hostname ? "(" + h.hostname + ")" : ""} ${h.gpu ? "- " + h.gpu : ""}</span>
         <span>${h.hw_model ? "[" + h.hw_model + "]" : ""} ${h.ssh ? "[SSH:22]" : ""} ${h.agent ? "[ZGX:18888]" : ""} ${h.enrolled ? "[ENROLLED]" : ""}</span>
       </div>
@@ -2809,9 +3782,10 @@ async function scanNetwork() {
   }
 }
 
-function pickHost(ip, name) {
+function pickHost(ip, name, hwModel) {
   document.getElementById("en-host").value = ip;
   if (!document.getElementById("en-alias").value) document.getElementById("en-alias").value = name;
+  if (hwModel) document.getElementById("en-tag").value = hwModel;
 }
 
 async function pollEnrollStatus() {
@@ -2824,7 +3798,7 @@ async function pollEnrollStatus() {
   if (st.running || st.log) {
     wrap.style.display = "block";
     log.style.display = "block";
-    const pct = Math.round(((st.step || 0) / (st.total_steps || 5)) * 100);
+    const pct = Math.round(((st.step || 0) / (st.total_steps || 3)) * 100);
     document.getElementById("enroll-phase").textContent = `Paso ${st.step}/${st.total_steps}: ${st.phase}`;
     document.getElementById("enroll-elapsed").textContent = `${st.elapsed_s || 0}s`;
     const bar = document.getElementById("enroll-bar");
@@ -2860,12 +3834,123 @@ async function submitEnroll() {
     ssh_pass: document.getElementById("en-pass").value,
   });
   if (!r.ok) {
-    alert(r.error || "Error al iniciar despliegue");
+    alert(r.error || "Error al iniciar enrolamiento");
     await pollEnrollStatus();
     return;
   }
   document.getElementById("en-pass").value = "";
   await pollEnrollStatus();
+}
+
+function openNodeDeployModal() {
+  if (selectedNodeId && selectedNodeId !== "local") openDeployModal(selectedNodeId);
+}
+
+async function openDeployModal(nodeId) {
+  let node = fleetNodesById[nodeId];
+  if (!node) {
+    const f = await api("GET", "/api/fleet");
+    if (f && f.nodes) {
+      f.nodes.forEach(n => { fleetNodesById[n.id] = n; });
+      node = fleetNodesById[nodeId];
+    }
+  }
+  if (!node || node.is_local) {
+    alert("Selecciona un nodo remoto para desplegar.");
+    return;
+  }
+  deployTargetNodeId = nodeId;
+  document.getElementById("dep-target").textContent = `${node.alias || node.host} (${node.host}:${node.port || 18888}) [${node.hw_model || "ZGX"}]`;
+  document.getElementById("dep-ssh-user").value = node.ssh_user || "iosu";
+  document.getElementById("dep-ssh-port").value = node.ssh_port || 22;
+  document.getElementById("dep-ssh-pass").value = "";
+
+  const listEl = document.getElementById("dep-list");
+  listEl.innerHTML = `<div style="padding:10px;color:var(--muted);font-size:12px;">Cargando catalogo...</div>`;
+  document.getElementById("deploy-modal").classList.add("open");
+
+  const cat = await api("GET", "/api/fleet/deploy/catalog");
+  const agentChecked = (!node.online || node.agent_installed === false) ? "checked" : "";
+  let html = `
+    <label class="deploy-item">
+      <input type="checkbox" id="dep-agent" ${agentChecked}>
+      <div>
+        <strong>${t("deployAgentName")}</strong>
+        <span>${t("deployAgentDesc")}</span>
+      </div>
+    </label>`;
+  for (const d of (cat.demos || [])) {
+    const desc = currentLang === "en" ? (d.desc_en || d.desc_es) : (d.desc_es || d.desc_en);
+    html += `
+      <label class="deploy-item">
+        <input type="checkbox" class="dep-demo-cb" value="${d.key}">
+        <div>
+          <strong>${d.name} (${d.key})</strong>
+          <span>${desc || ""}</span>
+        </div>
+      </label>`;
+  }
+  listEl.innerHTML = html;
+  await pollDeployStatus();
+}
+
+function closeDeployModal() {
+  document.getElementById("deploy-modal").classList.remove("open");
+  if (deployTimer) { clearInterval(deployTimer); deployTimer = null; }
+}
+
+async function pollDeployStatus() {
+  const st = await api("GET", "/api/fleet/deploy/status");
+  if (!st || st.phase === undefined) return;
+  const btn = document.getElementById("btn-dep-submit");
+  const wrap = document.getElementById("deploy-prog-wrap");
+  const log = document.getElementById("deploy-log");
+  const relevant = st.running || (st.log && (!deployTargetNodeId || st.node_id === deployTargetNodeId));
+  if (relevant) {
+    wrap.style.display = "block";
+    log.style.display = "block";
+    const pct = Math.round(((st.step || 0) / (st.total_steps || 3)) * 100);
+    document.getElementById("deploy-phase").textContent = `Paso ${st.step}/${st.total_steps}: ${st.phase}`;
+    document.getElementById("deploy-elapsed").textContent = `${st.elapsed_s || 0}s`;
+    const bar = document.getElementById("deploy-bar");
+    bar.style.width = pct + "%";
+    bar.className = "bar-fill" + (st.ok === false ? " crit" : (st.ok === true ? " gpu" : ""));
+    log.textContent = st.log || "";
+    log.scrollTop = log.scrollHeight;
+  } else {
+    wrap.style.display = "none";
+    log.style.display = "none";
+  }
+  btn.disabled = !!st.running;
+  if (st.running) {
+    if (!deployTimer) deployTimer = setInterval(pollDeployStatus, 800);
+  } else {
+    if (deployTimer) { clearInterval(deployTimer); deployTimer = null; }
+    if (st.ok === true) refresh();
+  }
+}
+
+async function submitDeploy() {
+  if (!deployTargetNodeId) return;
+  const deployAgent = !!(document.getElementById("dep-agent") && document.getElementById("dep-agent").checked);
+  const deployDemos = Array.from(document.querySelectorAll(".dep-demo-cb:checked")).map(cb => cb.value);
+  const btn = document.getElementById("btn-dep-submit");
+  btn.disabled = true;
+  const r = await api("POST", "/api/fleet/deploy", {
+    node_id: deployTargetNodeId,
+    ssh_user: document.getElementById("dep-ssh-user").value,
+    ssh_port: parseInt(document.getElementById("dep-ssh-port").value || "22", 10),
+    ssh_pass: document.getElementById("dep-ssh-pass").value,
+    deploy_agent: deployAgent,
+    deploy_demos: deployDemos,
+  });
+  if (!r.ok) {
+    alert(r.error || "Error al iniciar despliegue");
+    await pollDeployStatus();
+    return;
+  }
+  document.getElementById("dep-ssh-pass").value = "";
+  await pollDeployStatus();
 }
 
 async function svcAction(unit, action) {
@@ -2888,6 +3973,39 @@ async function stopDemo() {
   busy = true;
   try { await api("POST", `/api/node/${selectedNodeId}/stop`); }
   finally { busy = false; await refresh(); }
+}
+
+async function openNanoMode(mode) {
+  const popup = window.open("about:blank", "_blank");
+  if (popup && !popup.closed) {
+    try {
+      popup.document.title = t("switchingMode");
+      popup.document.body.style.cssText = "background:#080d14;color:#e6edf3;font-family:sans-serif;padding:24px;";
+      popup.document.body.textContent = t("switchingMode");
+    } catch (_) {}
+  }
+  busy = true;
+  try {
+    const r = await api("POST", `/api/node/${selectedNodeId}/nano-mode/${encodeURIComponent(mode)}`);
+    if (!r.ok) {
+      if (popup && !popup.closed) popup.close();
+      alert(r.error || t("errOp"));
+      return;
+    }
+    const targetUrl = "http://" + selectedNodeHost + ":18808" + (mode === "presenter" ? "/stage" : "/free");
+    if (popup && !popup.closed) {
+      popup.opener = null;
+      popup.location.href = targetUrl;
+    } else {
+      window.open(targetUrl, "_blank", "noopener");
+    }
+  } catch (err) {
+    if (popup && !popup.closed) popup.close();
+    alert(t("errOp"));
+  } finally {
+    busy = false;
+    await refresh();
+  }
 }
 
 async function pushFleetUpdate() {
@@ -3056,12 +4174,14 @@ function renderTokenBanner(elId, tokData, titleText, onResetFnName, extraDemoLab
 
 function renderFleet(data) {
   currentRole = data.role || "hub";
+  fleetNodesById = {};
+  (data.nodes || []).forEach(n => { fleetNodesById[n.id] = n; });
   document.getElementById("view-fleet").style.display = "block";
   document.getElementById("view-node").style.display = "none";
   document.getElementById("btn-back-fleet").style.display = "none";
   document.getElementById("btn-claim-master").style.display = "none";
   document.getElementById("btn-stop-all").style.display = "none";
-  document.getElementById("host-title").textContent = "HP ZGX Nano - Fleet Console";
+  document.getElementById("host-title").textContent = "HP ZGX - Fleet Console";
   document.getElementById("host-sub").textContent = t("subtitle") + " | Role: " + currentRole.toUpperCase();
   document.getElementById("btn-role-toggle").textContent = "Role: " + currentRole.toUpperCase();
   const gs = document.getElementById("global-status");
@@ -3103,7 +4223,7 @@ function renderFleet(data) {
         <div class="demo-footer">
           <span class="port-lbl">Demo: ${demoStr} | Inst: ${n.demos_installed ?? 0}/${n.demos_total ?? 0}</span>
           <div class="btn-row">
-            ${!n.is_local ? `<button class="danger" onclick="removeNode('${n.id}')">${t("removeNode")}</button>` : ""}
+            ${!n.is_local ? `<button class="primary" onclick="openDeployModal('${n.id}')">${t("deployBtn")}</button><button class="danger" onclick="removeNode('${n.id}')">${t("removeNode")}</button>` : ""}
             <button class="solid" ${!n.online ? "disabled" : ""} onclick="enterNode('${n.id}', '${n.host}')">${t("enterNode")}</button>
           </div>
         </div>
@@ -3117,6 +4237,7 @@ function renderNodeData(data) {
   document.getElementById("view-node").style.display = "block";
   document.getElementById("btn-back-fleet").style.display = currentRole === "hub" ? "inline-flex" : "none";
   document.getElementById("btn-claim-master").style.display = currentRole === "node" ? "inline-flex" : "none";
+  document.getElementById("btn-node-deploy").style.display = (selectedNodeId && selectedNodeId !== "local") ? "inline-flex" : "none";
   document.getElementById("btn-stop-all").style.display = "inline-flex";
 
   document.getElementById("host-title").textContent = "HP ZGX Nano (" + (sys.hostname || "zgx") + ")";
@@ -3232,14 +4353,20 @@ function renderNodeData(data) {
   for (const [key, d] of Object.entries(data.demos || {})) {
     const isActive = active.key === key, isReady = isActive && active.status === "ready";
     const badgeCls = isReady ? "ready" : (isActive ? "starting" : "");
-    const badgeTxt = !d.installed ? "[NOT INSTALLED]" : (isReady ? "[READY]" : (isActive ? `[STARTING ${active.uptime_s}s]` : "[OFF]"));
+    const readyTag = key === "nano-collective" && d.nano_mode ? (d.nano_mode === "presenter" ? "[READY - STAGE]" : "[READY - FREE]") : "[READY]";
+    const badgeTxt = !d.installed ? "[NOT INSTALLED]" : (isReady ? readyTag : (isActive ? `[STARTING ${active.uptime_s}s]` : "[OFF]"));
     const desc = currentLang === "en" ? (d.desc_en || d.desc_es) : (d.desc_es || d.desc_en);
     const url = "http://" + selectedNodeHost + ":" + d.port + d.route;
+    const actionBtns = isReady
+      ? (key === "nano-collective"
+          ? `<button class="${d.nano_mode === "free" ? "open" : ""}" onclick="openNanoMode('free')">${t("openFree")}</button><button class="${d.nano_mode === "presenter" ? "open" : "primary"}" onclick="openNanoMode('presenter')">${t("openStage")}</button>`
+          : `<a class="btn open" href="${url}" target="_blank" rel="noopener">${t("open")}</a>`)
+      : "";
     const dTok = (tokData.by_demo && tokData.by_demo[key]) || { total_tokens: 0, input_tokens: 0, output_tokens: 0, eur_saved: 0 };
     const card = document.createElement("div");
     card.className = "demo-card" + (isActive ? " active" : "");
     if (!d.installed) card.style.opacity = "0.62";
-    card.innerHTML = `<div class="thumb">${THUMBS[key] || ""}<span class="thumb-tag">${d.tag}</span><span class="thumb-state ${badgeCls}">${badgeTxt}</span></div><div class="demo-body"><div><h2>${d.name}</h2><p>${desc}</p><div class="demo-tok-bar"><span>${t("tokensLbl")}: <strong>${(dTok.total_tokens || 0).toLocaleString()}</strong> (${fmtTokens(dTok.input_tokens || 0)}/${fmtTokens(dTok.output_tokens || 0)})</span><span class="eur-tag">${fmtEur(dTok.eur_saved || 0)}</span></div></div><div class="demo-footer"><span class="port-lbl">:${d.port} ${!d.installed ? "| N/A" : ""}</span><div class="btn-row">${isReady ? `<a class="btn open" href="${url}" target="_blank" rel="noopener">${t("open")}</a>` : ""}<label class="switch"><input type="checkbox" ${isActive ? "checked" : ""} ${!d.installed ? "disabled" : ""} onchange="toggleDemo('${key}', this.checked)"><span class="slider"></span></label></div></div></div>`;
+    card.innerHTML = `<div class="thumb">${THUMBS[key] || ""}<span class="thumb-tag">${d.tag}</span><span class="thumb-state ${badgeCls}">${badgeTxt}</span></div><div class="demo-body"><div><h2>${d.name}</h2><p>${desc}</p><div class="demo-tok-bar"><span>${t("tokensLbl")}: <strong>${(dTok.total_tokens || 0).toLocaleString()}</strong> (${fmtTokens(dTok.input_tokens || 0)}/${fmtTokens(dTok.output_tokens || 0)})</span><span class="eur-tag">${fmtEur(dTok.eur_saved || 0)}</span></div></div><div class="demo-footer"><span class="port-lbl">:${d.port} ${!d.installed ? "| N/A" : ""}</span><div class="btn-row">${actionBtns}<label class="switch"><input type="checkbox" ${isActive ? "checked" : ""} ${!d.installed ? "disabled" : ""} onchange="toggleDemo('${key}', this.checked)"><span class="slider"></span></label></div></div></div>`;
     grid.appendChild(card);
   }
 
@@ -3361,6 +4488,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, get_fleet_status())
         elif self.path == "/api/fleet/enroll/status":
             self._send_json(HTTPStatus.OK, get_enroll_status())
+        elif self.path == "/api/fleet/deploy/catalog":
+            self._send_json(HTTPStatus.OK, get_deploy_catalog())
+        elif self.path == "/api/fleet/deploy/status":
+            self._send_json(HTTPStatus.OK, get_deploy_status())
         elif self.path == "/api/users":
             self._send_json(HTTPStatus.OK, {"ok": True, "users": list_users()})
         elif self.path.startswith("/api/node/"):
@@ -3392,6 +4523,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, scan_local_network(body.get("cidr", "")))
         elif self.path == "/api/fleet/enroll":
             self._send_json(HTTPStatus.OK, enroll_node(self._read_json()))
+        elif self.path == "/api/fleet/deploy":
+            self._send_json(HTTPStatus.OK, deploy_to_node(self._read_json()))
         elif self.path == "/api/fleet/sync":
             self._send_json(HTTPStatus.OK, apply_fleet_sync(self._read_json()))
         elif self.path == "/api/fleet/claim-master":
@@ -3436,6 +4569,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, start_demo(key))
         elif self.path == "/api/stop":
             self._send_json(HTTPStatus.OK, stop_demo())
+        elif self.path.startswith("/api/nano-mode/"):
+            mode = self.path.split("/api/nano-mode/", 1)[1].strip("/")
+            self._send_json(HTTPStatus.OK, switch_nano_mode(mode))
         elif self.path == "/api/tokens/reset":
             self._send_json(HTTPStatus.OK, reset_token_ledger())
         elif self.path == "/api/fleet/tokens/reset":
