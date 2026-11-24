@@ -2261,6 +2261,14 @@ def sync_fleet_to_peers() -> list[str]:
     def _push_to_target(target_nodes: list[dict]) -> tuple[list[str], list[str]]:
         full_ring = [self_peer] + [n for n in target_nodes if n.get("host") != local_ip]
         users_snapshot = cfg.get("users", {})
+        try:
+            ssh_creds_snapshot = _load_ssh_credentials()
+        except Exception:
+            ssh_creds_snapshot = {}
+        try:
+            rates_snapshot = _load_token_ledger().get("rates", dict(DEFAULT_TOKEN_RATES))
+        except Exception:
+            rates_snapshot = dict(DEFAULT_TOKEN_RATES)
         failed_list = []
         unreachable_list = []
         for n in target_nodes:
@@ -2280,7 +2288,12 @@ def sync_fleet_to_peers() -> list[str]:
                     n.get("token", ""),
                     method="POST",
                     timeout=1.5,
-                    body={"peers": peers_for_target, "users": users_snapshot},
+                    body={
+                        "peers": peers_for_target,
+                        "users": users_snapshot,
+                        "ssh_credentials": ssh_creds_snapshot,
+                        "token_rates": rates_snapshot,
+                    },
                 )
                 if not isinstance(result, dict) or result.get("ok") is not True:
                     failed_list.append(n["host"])
@@ -2291,11 +2304,91 @@ def sync_fleet_to_peers() -> list[str]:
 
     failed, unreachable = _push_to_target(nodes)
     if unreachable:
-        rec = reconcile_fleet_ips(missing_hosts=unreachable, allow_subnet_scan=False)
+        rec = reconcile_fleet_ips(missing_hosts=unreachable, allow_subnet_scan=(len(unreachable) >= len(nodes)))
         if rec.get("updated"):
             nodes = load_fleet()
             failed, _ = _push_to_target(nodes)
     return failed
+
+
+def reorganize_fleet_action() -> dict:
+    cfg = load_config()
+    rec = reconcile_fleet_ips(allow_subnet_scan=True)
+    sync_failed = []
+    if cfg.get("role") == "hub":
+        sync_failed = sync_fleet_to_peers()
+    else:
+        check_master_and_failover(allow_subnet_scan=True)
+    return {
+        "ok": True,
+        "role": load_config().get("role", cfg.get("role")),
+        "updated": rec.get("updated", []),
+        "sync_failed": sync_failed,
+    }
+
+
+def start_all_nano_collective_action() -> dict:
+    nodes = load_fleet()
+    local_ip = get_local_ip()
+    started = []
+    failed = []
+
+    def _is_nano(node: dict) -> bool:
+        hw = str(node.get("hw_model") or node.get("tag") or "").upper()
+        return "FURY" not in hw
+
+    def _start_one(node: dict) -> tuple[str, bool, str]:
+        label = node.get("alias") or node["host"]
+        try:
+            res = _node_http_json(
+                node["host"], node.get("port", 18888),
+                "/api/start/nano-collective", node.get("token", ""),
+                method="POST", timeout=20.0,
+            )
+            if isinstance(res, dict) and res.get("ok") is True:
+                return label, True, ""
+            return label, False, str((res or {}).get("error") or "Error al iniciar")
+        except Exception as exc:
+            return label, False, str(exc)
+
+    try:
+        local_hw = get_status().get("system", {}).get("hw", {}).get("hw_model", "")
+        if "FURY" not in str(local_hw).upper():
+            r_loc = start_demo("nano-collective")
+            if r_loc.get("ok"):
+                started.append("local")
+            else:
+                failed.append({"host": "local", "error": r_loc.get("error", "Error")})
+    except Exception:
+        pass
+
+    targets = [n for n in nodes if n.get("host") and n.get("host") != local_ip and _is_nano(n)]
+    if targets:
+        retry_nodes = []
+        with ThreadPoolExecutor(max_workers=min(12, len(targets))) as pool:
+            for node, (label, ok_flag, err_msg) in zip(targets, pool.map(_start_one, targets)):
+                if ok_flag:
+                    started.append(label)
+                elif "timed out" in err_msg or "No route" in err_msg or "Connection" in err_msg:
+                    retry_nodes.append((node, label, err_msg))
+                else:
+                    failed.append({"host": label, "error": err_msg})
+        if retry_nodes:
+            rec = reconcile_fleet_ips(missing_hosts=[n["host"] for n, _, _ in retry_nodes], allow_subnet_scan=True)
+            if rec.get("updated"):
+                updated_by_id = {n["id"]: n for n in load_fleet()}
+                retry_targets = [updated_by_id.get(n["id"], n) for n, _, _ in retry_nodes]
+                with ThreadPoolExecutor(max_workers=min(12, len(retry_targets))) as pool:
+                    for label, ok_flag, err_msg in pool.map(_start_one, retry_targets):
+                        if ok_flag:
+                            started.append(label)
+                        else:
+                            failed.append({"host": label, "error": err_msg})
+            else:
+                for _, label, err_msg in retry_nodes:
+                    failed.append({"host": label, "error": err_msg})
+
+    return {"ok": True, "started": started, "failed": failed}
 
 
 def apply_fleet_sync(payload: dict) -> dict:
@@ -2317,6 +2410,31 @@ def apply_fleet_sync(payload: dict) -> dict:
             merged_users.setdefault(username, credentials)
         cfg["users"] = merged_users
         save_config(cfg)
+    ssh_creds = payload.get("ssh_credentials")
+    if isinstance(ssh_creds, dict) and ssh_creds:
+        try:
+            with SSH_CREDENTIALS_LOCK:
+                merged_creds = _load_ssh_credentials()
+                changed_creds = False
+                for k, v in ssh_creds.items():
+                    if k not in merged_creds and isinstance(v, str) and v:
+                        merged_creds[k] = v
+                        changed_creds = True
+                if changed_creds:
+                    DEMOS_ROOT.mkdir(parents=True, exist_ok=True)
+                    SSH_CREDENTIALS_FILE.write_text(json.dumps(merged_creds, indent=2), encoding="utf-8")
+                    try:
+                        os.chmod(SSH_CREDENTIALS_FILE, 0o600)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+    rates = payload.get("token_rates")
+    if isinstance(rates, dict) and "input_eur_per_1m" in rates and "output_eur_per_1m" in rates:
+        try:
+            update_token_rates(float(rates["input_eur_per_1m"]), float(rates["output_eur_per_1m"]))
+        except Exception:
+            pass
     return {"ok": True}
 
 
@@ -4617,6 +4735,128 @@ def locate_node_action(duration_s: int = 8) -> dict:
     return {"ok": True, "duration_s": duration_s, "hostname": socket.gethostname()}
 
 
+def _run_nmcli(args: list[str], timeout: int = 15) -> subprocess.CompletedProcess:
+    cmd = ["nmcli"] + args
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if res.returncode == 0:
+        return res
+    sudo_res = subprocess.run(["sudo", "-n", "/usr/bin/nmcli"] + args, capture_output=True, text=True, timeout=timeout)
+    return sudo_res if sudo_res.returncode == 0 or not res.stderr else res
+
+
+def _get_active_nm_connection() -> dict | None:
+    res = subprocess.run(
+        ["nmcli", "-t", "-f", "NAME,TYPE,DEVICE,UUID", "connection", "show", "--active"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if res.returncode != 0:
+        return None
+    conns = []
+    for line in res.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) < 4:
+            continue
+        name, ctype, dev, uuid = parts[0], parts[1], parts[2], parts[3]
+        if ctype in ("802-3-ethernet", "802-11-wireless"):
+            conns.append({"name": name, "type": ctype, "device": dev, "uuid": uuid})
+    if not conns:
+        return None
+    conns.sort(key=lambda c: 0 if c["type"] == "802-3-ethernet" else 1)
+    return conns[0]
+
+
+def _default_gateway_and_cidr(device: str) -> tuple[str, str]:
+    gw = ""
+    cidr = ""
+    try:
+        r = subprocess.run(["ip", "-4", "route", "show", "default"], capture_output=True, text=True, timeout=4)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if "via" in parts:
+                gw = parts[parts.index("via") + 1]
+                break
+    except Exception:
+        pass
+    try:
+        r2 = subprocess.run(["ip", "-4", "-o", "addr", "show", "dev", device], capture_output=True, text=True, timeout=4)
+        for line in r2.stdout.splitlines():
+            parts = line.split()
+            if "inet" in parts:
+                cidr = parts[parts.index("inet") + 1]
+                break
+    except Exception:
+        pass
+    return gw, cidr
+
+
+def set_network_mode_action(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Payload invalido."}
+    mode = str(payload.get("mode", "")).strip().lower()
+    if mode not in ("static", "dhcp"):
+        return {"ok": False, "error": "Modo de red invalido (usa static o dhcp)."}
+    conn = _get_active_nm_connection()
+    if not conn:
+        return {"ok": False, "error": "No se encontro una conexion NetworkManager activa."}
+    uuid = conn["uuid"]
+    cur_gw, cur_cidr = _default_gateway_and_cidr(conn["device"])
+
+    if mode == "static":
+        ip_cidr = str(payload.get("ip_cidr") or cur_cidr or "").strip()
+        if not ip_cidr:
+            return {"ok": False, "error": "No se pudo determinar la IP/CIDR actual."}
+        if "/" not in ip_cidr:
+            ip_cidr = f"{ip_cidr}/24"
+        try:
+            iface = ipaddress.ip_interface(ip_cidr)
+            ip_cidr = str(iface)
+        except ValueError:
+            return {"ok": False, "error": f"IP/CIDR invalida: {ip_cidr}"}
+        gateway = str(payload.get("gateway") or cur_gw or "").strip()
+        if not gateway:
+            gateway = str(iface.network.network_address + 1)
+        try:
+            ipaddress.ip_address(gateway)
+        except ValueError:
+            return {"ok": False, "error": f"Gateway invalido: {gateway}"}
+        dns = str(payload.get("dns") or f"{gateway},8.8.8.8").strip()
+        mod = _run_nmcli([
+            "connection", "modify", uuid,
+            "ipv4.method", "manual",
+            "ipv4.addresses", ip_cidr,
+            "ipv4.gateway", gateway,
+            "ipv4.dns", dns,
+        ])
+        if mod.returncode != 0:
+            return {"ok": False, "error": (mod.stderr or mod.stdout or "Error configurando IP fija").strip()}
+        summary = {"ok": True, "mode": "static", "connection": conn["name"], "device": conn["device"], "ip_cidr": ip_cidr, "gateway": gateway, "dns": dns}
+    else:
+        mod = _run_nmcli([
+            "connection", "modify", uuid,
+            "ipv4.method", "auto",
+            "ipv4.addresses", "",
+            "ipv4.gateway", "",
+            "ipv4.dns", "",
+        ])
+        if mod.returncode != 0:
+            return {"ok": False, "error": (mod.stderr or mod.stdout or "Error configurando DHCP").strip()}
+        summary = {"ok": True, "mode": "dhcp", "connection": conn["name"], "device": conn["device"]}
+
+    def _reapply():
+        time.sleep(1.0)
+        _run_nmcli(["connection", "up", uuid], timeout=20)
+        time.sleep(2.0)
+        try:
+            hubs = [n for n in load_fleet() if n.get("role") == "hub"]
+            if hubs:
+                announce_self_to_hub(hubs[0])
+        except Exception:
+            pass
+
+    threading.Thread(target=_reapply, daemon=True).start()
+    return summary
+
+
 def prune_docker_action() -> dict:
     try:
         res = subprocess.run(
@@ -4678,7 +4918,7 @@ def push_update_fleet() -> dict:
     return {"ok": True, "results": results}
 
 
-def proxy_node_request(node_id: str, sub_path: str, method: str = "GET") -> dict:
+def proxy_node_request(node_id: str, sub_path: str, method: str = "GET", body: dict = None) -> dict:
     if node_id == "local":
         if method == "GET" and sub_path == "/status":
             return get_status()
@@ -4692,6 +4932,8 @@ def proxy_node_request(node_id: str, sub_path: str, method: str = "GET") -> dict
             return free_gpu_action()
         if method == "POST" and sub_path == "/locate":
             return locate_node_action()
+        if method == "POST" and sub_path == "/network/mode":
+            return set_network_mode_action(body or {})
         if method == "POST" and sub_path == "/prune-docker":
             return prune_docker_action()
         if method == "POST" and sub_path.startswith("/power/"):
@@ -4710,7 +4952,7 @@ def proxy_node_request(node_id: str, sub_path: str, method: str = "GET") -> dict
         return {"ok": True, **snapshot} if snapshot else {"ok": False, "error": "Sin datos sincronizados."}
     try:
         return _node_http_json(
-            node["host"], node.get("port", 18888), "/api" + sub_path, node.get("token", ""), method=method, timeout=120.0
+            node["host"], node.get("port", 18888), "/api" + sub_path, node.get("token", ""), method=method, timeout=120.0, body=body
         )
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
@@ -5132,6 +5374,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div id="fleet-sub" class="sub"></div>
       </div>
       <div class="btn-row">
+        <button id="btn-start-all-nano" class="solid" onclick="startAllNanoCollective()"></button>
+        <button id="btn-reorganize-fleet" class="primary" onclick="reorganizeFleet()"></button>
         <button id="btn-push-update" class="primary" onclick="pushFleetUpdate()"></button>
         <button id="btn-role-toggle" onclick="toggleLocalRole()"></button>
         <button id="btn-add-node" class="solid" onclick="openEnrollModal()"></button>
@@ -5185,6 +5429,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="btn-row">
         <button id="btn-node-deploy" class="solid" style="display:none;" onclick="openNodeDeployModal()"></button>
         <button id="btn-locate-node" onclick="locateNodeAction()"></button>
+        <button id="btn-static-ip" onclick="networkModeAction('static')"></button>
+        <button id="btn-dhcp-ip" onclick="networkModeAction('dhcp')"></button>
         <button id="btn-free-gpu" class="primary" onclick="freeGpuAction()"></button>
         <button id="btn-prune-docker" class="warn" onclick="pruneDockerAction()"></button>
         <button id="btn-reboot" onclick="powerAction('reboot')"></button>
@@ -5479,7 +5725,7 @@ const I18N = {
     svcSearchPh: "Buscar servicio (ej. ollama, ssh, docker)...",
     sortRam: "Orden: Mayor RAM", sortCpu: "Orden: Mayor CPU", sortActive: "Orden: Activos primero", sortName: "Orden: Nombre (A-Z)",
     viewCards: "Vista: Tarjetas", viewTable: "Vista: Tabla compacta",
-    pushUpdate: "Actualizar Flota", locateNode: "Localizar (ventilador)", freeGpu: "Liberar GPU", pruneDocker: "Limpiar Docker",
+    pushUpdate: "Actualizar Flota", startAllNano: "Levantar Nano Collective", reorganizeFleet: "Reorganizar Red", locateNode: "Localizar (ventilador)", staticIp: "IP Fija", dhcpIp: "DHCP", freeGpu: "Liberar GPU", pruneDocker: "Limpiar Docker",
     rebootHost: "Reiniciar equipo", poweroffHost: "Apagar equipo", lowDisk: "[WARN] Poco espacio libre",
     fleetTokTitle: "Contador global de tokens y ahorro en Euros (Todas las unidades HW)",
     nodeTokTitle: "Medidor de tokens y ahorro en Euros (Este dispositivo)",
@@ -5578,7 +5824,7 @@ const I18N = {
     svcSearchPh: "Search service (e.g. ollama, ssh, docker)...",
     sortRam: "Sort: Highest RAM", sortCpu: "Sort: Highest CPU", sortActive: "Sort: Active first", sortName: "Sort: Name (A-Z)",
     viewCards: "View: Cards", viewTable: "View: Compact table",
-    pushUpdate: "Push Fleet Update", locateNode: "Locate (fan burst)", freeGpu: "Free GPU", pruneDocker: "Prune Docker",
+    pushUpdate: "Push Fleet Update", startAllNano: "Start All Nano Collective", reorganizeFleet: "Reorganize Network", locateNode: "Locate (fan burst)", staticIp: "Static IP", dhcpIp: "DHCP", freeGpu: "Free GPU", pruneDocker: "Prune Docker",
     rebootHost: "Reboot host", poweroffHost: "Power off", lowDisk: "[WARN] Low disk space",
     fleetTokTitle: "Global fleet token meter & Euro savings (All HW units)",
     nodeTokTitle: "Token meter & Euro savings (This device)",
@@ -5728,8 +5974,12 @@ function applyStaticLabels() {
   document.getElementById("opt-sort-name").textContent = t("sortName");
   document.getElementById("opt-view-cards").textContent = t("viewCards");
   document.getElementById("opt-view-table").textContent = t("viewTable");
+  document.getElementById("btn-start-all-nano").textContent = t("startAllNano");
+  document.getElementById("btn-reorganize-fleet").textContent = t("reorganizeFleet");
   document.getElementById("btn-push-update").textContent = t("pushUpdate");
   document.getElementById("btn-locate-node").textContent = t("locateNode");
+  document.getElementById("btn-static-ip").textContent = t("staticIp");
+  document.getElementById("btn-dhcp-ip").textContent = t("dhcpIp");
   document.getElementById("btn-free-gpu").textContent = t("freeGpu");
   document.getElementById("btn-prune-docker").textContent = t("pruneDocker");
   document.getElementById("btn-reboot").textContent = t("rebootHost");
@@ -6578,6 +6828,32 @@ async function openNanoMode(mode) {
   }
 }
 
+async function startAllNanoCollective() {
+  if (!confirm("Arrancar Nano Collective en todas las NanoZGX registradas?")) return;
+  const btn = document.getElementById("btn-start-all-nano");
+  btn.disabled = true;
+  try {
+    const r = await api("POST", "/api/fleet/start-nano-collective", {});
+    if (!r.ok) { alert(r.error || t("errOp")); return; }
+    const okTxt = (r.started && r.started.length) ? ("Iniciadas: " + r.started.join(", ")) : "Ninguna iniciada";
+    const errTxt = (r.failed && r.failed.length) ? ("\nFallos: " + r.failed.map(f => `${f.host} (${f.error})`).join("; ")) : "";
+    alert(okTxt + errTxt);
+    await refresh();
+  } finally { btn.disabled = false; }
+}
+
+async function reorganizeFleet() {
+  const btn = document.getElementById("btn-reorganize-fleet");
+  btn.disabled = true;
+  try {
+    const r = await api("POST", "/api/fleet/reorganize", {});
+    if (!r.ok) { alert(r.error || t("errOp")); return; }
+    const upd = (r.updated && r.updated.length) ? r.updated.map(u => `${u[0]} -> ${u[1]}`).join(", ") : "Sin cambios de IP";
+    alert(`Red reorganizada (rol: ${r.role}).\nActualizaciones: ${upd}`);
+    await refresh();
+  } finally { btn.disabled = false; }
+}
+
 async function pushFleetUpdate() {
   const btn = document.getElementById("btn-push-update");
   btn.disabled = true;
@@ -6595,6 +6871,25 @@ async function locateNodeAction() {
   const r = await api("POST", `/api/node/${selectedNodeId}/locate`);
   if (!r.ok) { alert(r.error || t("errOp")); return; }
   alert(`Rafaga de ventilador iniciada en ${r.hostname || selectedNodeHost} (${r.duration_s || 8}s).`);
+}
+
+async function networkModeAction(mode) {
+  let payload = { mode };
+  if (mode === "static") {
+    const curIp = selectedNodeHost && selectedNodeHost !== "localhost" ? `${selectedNodeHost}/24` : "";
+    const ipCidr = prompt("IP fija con mascara (ej. 192.168.1.104/24):", curIp);
+    if (!ipCidr) return;
+    const gw = prompt("Gateway (dejar vacio para usar el actual):", "");
+    payload.ip_cidr = ipCidr.trim();
+    if (gw && gw.trim()) payload.gateway = gw.trim();
+  } else {
+    if (!confirm(`Pasar la interfaz activa de ${selectedNodeHost} a DHCP?`)) return;
+  }
+  const r = await api("POST", `/api/node/${selectedNodeId}/network/mode`, payload);
+  if (!r.ok) { alert(r.error || t("errOp")); return; }
+  alert(mode === "static"
+    ? `IP fija aplicada en ${r.device}: ${r.ip_cidr} (GW ${r.gateway}).`
+    : `Interfaz ${r.device} pasada a DHCP.`);
 }
 
 async function freeGpuAction() {
@@ -7557,6 +7852,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_response(HTTPStatus.FOUND)
                 self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
             return
         if self.path == "/" or self.path == "/index.html":
@@ -7678,12 +7974,18 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, claim_master())
         elif self.path == "/api/fleet/push-update":
             self._send_json(HTTPStatus.OK, push_update_fleet())
+        elif self.path == "/api/fleet/reorganize":
+            self._send_json(HTTPStatus.OK, reorganize_fleet_action())
+        elif self.path == "/api/fleet/start-nano-collective":
+            self._send_json(HTTPStatus.OK, start_all_nano_collective_action())
         elif self.path == "/api/node/self-update":
             self._send_json(HTTPStatus.OK, self_update_node(self._read_json()))
         elif self.path == "/api/free-gpu":
             self._send_json(HTTPStatus.OK, free_gpu_action())
         elif self.path == "/api/locate":
             self._send_json(HTTPStatus.OK, locate_node_action())
+        elif self.path == "/api/network/mode":
+            self._send_json(HTTPStatus.OK, set_network_mode_action(self._read_json()))
         elif self.path == "/api/prune-docker":
             self._send_json(HTTPStatus.OK, prune_docker_action())
         elif self.path.startswith("/api/power/"):
@@ -7706,7 +8008,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/api/node/"):
             rest = self.path.split("/api/node/", 1)[1]
             node_id, _, sub = rest.partition("/")
-            self._send_json(HTTPStatus.OK, proxy_node_request(node_id, "/" + sub, method="POST"))
+            self._send_json(HTTPStatus.OK, proxy_node_request(node_id, "/" + sub, method="POST", body=self._read_json()))
         elif self.path.startswith("/api/service/"):
             parts = self.path.split("/api/service/", 1)[1].strip("/").split("/")
             if len(parts) == 2:
@@ -7759,8 +8061,16 @@ def main():
     load_config()
     signal.signal(signal.SIGINT, handle_exit)
     signal.signal(signal.SIGTERM, handle_exit)
+    def _boot_reconcile():
+        time.sleep(3)
+        try:
+            reorganize_fleet_action()
+        except Exception as exc:
+            print(f"[WARN] Reorganizacion inicial de red: {exc}", flush=True)
+
     threading.Thread(target=telemetry_loop, daemon=True).start()
     threading.Thread(target=discovery_loop, daemon=True).start()
+    threading.Thread(target=_boot_reconcile, daemon=True).start()
     threading.Thread(target=fleet_sync_loop, daemon=True).start()
     threading.Thread(target=fleet_resilience_loop, daemon=True).start()
     threading.Thread(target=fleet_monitoring_loop, daemon=True).start()

@@ -157,6 +157,72 @@ class ResilienceTests(unittest.TestCase):
         self.assertEqual(launcher_web.load_config()["role"], "node")
         self.assertEqual(launcher_web.load_fleet()[0]["role"], "hub")
 
+    def test_apply_fleet_sync_replicates_ssh_credentials_and_token_rates(self):
+        orig_ssh = launcher_web.SSH_CREDENTIALS_FILE
+        orig_tok = launcher_web.TOKEN_LEDGER_FILE
+        launcher_web.SSH_CREDENTIALS_FILE = self.root / "ssh-credentials.json"
+        launcher_web.TOKEN_LEDGER_FILE = self.root / "token_ledger.json"
+        try:
+            launcher_web.CONFIG_FILE.write_text(
+                json.dumps({"role": "node", "node_token": "n-tok", "node_id": "n-1", "hub_epoch": 0}),
+                encoding="utf-8",
+            )
+            res = launcher_web.apply_fleet_sync({
+                "peers": [{"id": "hub-1", "host": "192.168.1.122", "port": 18888, "token": "h-tok", "role": "hub"}],
+                "ssh_credentials": {'["", 0, "nvidia"]': "Demo4NVDA!!!"},
+                "token_rates": {"input_eur_per_1m": 3.5, "output_eur_per_1m": 15.0},
+            })
+            self.assertTrue(res["ok"])
+            self.assertEqual(launcher_web._load_ssh_credentials()['["", 0, "nvidia"]'], "Demo4NVDA!!!")
+            ledger = json.loads(launcher_web.TOKEN_LEDGER_FILE.read_text(encoding="utf-8"))
+            self.assertEqual(ledger["rates"]["input_eur_per_1m"], 3.5)
+        finally:
+            launcher_web.SSH_CREDENTIALS_FILE = orig_ssh
+            launcher_web.TOKEN_LEDGER_FILE = orig_tok
+
+    def test_set_network_mode_static_and_dhcp(self):
+        conn = {"name": "Wired", "type": "802-3-ethernet", "device": "eth0", "uuid": "uuid-123"}
+        ok_proc = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(launcher_web, "_get_active_nm_connection", return_value=conn), \
+             mock.patch.object(launcher_web, "_default_gateway_and_cidr", return_value=("192.168.1.1", "192.168.1.104/24")), \
+             mock.patch.object(launcher_web, "_run_nmcli", return_value=ok_proc) as run_nm, \
+             mock.patch.object(launcher_web.threading, "Thread") as th:
+            res_static = launcher_web.set_network_mode_action({"mode": "static", "ip_cidr": "192.168.1.104/24"})
+            self.assertTrue(res_static["ok"])
+            self.assertEqual(res_static["mode"], "static")
+            self.assertEqual(res_static["gateway"], "192.168.1.1")
+            th.return_value.start.assert_called()
+
+            res_dhcp = launcher_web.set_network_mode_action({"mode": "dhcp"})
+            self.assertTrue(res_dhcp["ok"])
+            self.assertEqual(res_dhcp["mode"], "dhcp")
+            self.assertGreaterEqual(run_nm.call_count, 2)
+
+    def test_start_all_nano_collective_starts_nanos_and_skips_fury(self):
+        launcher_web.CONFIG_FILE.write_text(
+            json.dumps({"role": "hub", "node_token": "hub-tok", "node_id": "hub-1", "hub_epoch": 1}),
+            encoding="utf-8",
+        )
+        launcher_web.save_fleet([
+            {"id": "nano-1", "alias": "nano-1", "hw_model": "ZGX-NANO", "host": "10.0.0.11", "port": 18888, "token": "t1", "role": "node"},
+            {"id": "fury-2", "alias": "fury-2", "hw_model": "ZGX-FURY", "host": "10.0.0.12", "port": 18888, "token": "t2", "role": "node"},
+        ])
+        called = []
+
+        def fake_http(host, port, path, token, method="GET", **kwargs):
+            called.append((host, path))
+            return {"ok": True}
+
+        with mock.patch.object(launcher_web, "get_local_ip", return_value="10.0.0.10"), \
+             mock.patch.object(launcher_web, "get_status", return_value={"system": {"hw": {"hw_model": "ZGX-FURY"}}}), \
+             mock.patch.object(launcher_web, "_node_http_json", side_effect=fake_http):
+            res = launcher_web.start_all_nano_collective_action()
+
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["started"], ["nano-1"])
+        self.assertEqual(res["failed"], [])
+        self.assertEqual(called, [("10.0.0.11", "/api/start/nano-collective")])
+
 
 if __name__ == "__main__":
     unittest.main()

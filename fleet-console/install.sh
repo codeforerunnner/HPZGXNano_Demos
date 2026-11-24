@@ -11,7 +11,7 @@ if [[ "$(uname -s)" != "Linux" ]]; then
 fi
 
 USER_NAME=$(id -un)
-echo "$USER_NAME ALL=(root) NOPASSWD: /usr/bin/systemctl start *.service, /usr/bin/systemctl stop *.service, /usr/bin/systemctl restart *.service, /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff, /usr/bin/docker system prune *" > /tmp/zgx-launcher.sudoers
+echo "$USER_NAME ALL=(root) NOPASSWD: /usr/bin/systemctl start *.service, /usr/bin/systemctl stop *.service, /usr/bin/systemctl restart *.service, /usr/bin/systemctl reboot, /usr/bin/systemctl poweroff, /usr/bin/docker system prune *, /usr/bin/nmcli *" > /tmp/zgx-launcher.sudoers
 sudo chown root:root /tmp/zgx-launcher.sudoers
 sudo chmod 440 /tmp/zgx-launcher.sudoers
 sudo visudo -cf /tmp/zgx-launcher.sudoers
